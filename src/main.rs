@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tracing::info;
@@ -38,30 +39,40 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = Config::load_or_create(&cli.config)?;
+    let config = Config::load_or_create(&cli.config).await?;
 
     match cli.command.unwrap_or(Commands::Run) {
         Commands::Run => {
             info!("Starting DHCP server with config: {:?}", cli.config);
             let server = DhcpServer::new(config).await?;
-            server.run().await
+
+            tokio::select! {
+                result = server.run() => result,
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received shutdown signal, stopping server...");
+                    if let Err(error) = server.save_leases().await {
+                        tracing::error!("Failed to save leases on shutdown: {}", error);
+                    }
+                    Ok(())
+                }
+            }
         }
         Commands::ShowConfig => {
             println!("{}", serde_json::to_string_pretty(&config)?);
             Ok(())
         }
         Commands::ListLeases => {
-            let lease_manager = dhcplease::LeaseManager::new(config)?;
-            let leases = lease_manager.list_leases().await;
+            let store = dhcplease::Leases::new(Arc::new(config)).await?;
+            let leases = store.list_leases().await;
 
             if leases.is_empty() {
                 println!("No active leases.");
             } else {
                 println!(
-                    "{:<18} {:<16} {:<24} {:<10}",
-                    "MAC Address", "IP Address", "Expires At", "Remaining"
+                    "{:<24} {:<16} {:<24} {:<10}",
+                    "Client ID", "IP Address", "Expires At", "Remaining"
                 );
-                println!("{}", "-".repeat(70));
+                println!("{}", "-".repeat(76));
 
                 for lease in leases {
                     let remaining = lease.remaining_seconds();
@@ -72,8 +83,8 @@ async fn main() -> Result<()> {
                     };
 
                     println!(
-                        "{:<18} {:<16} {:<24} {:<10}",
-                        lease.mac_address,
+                        "{:<24} {:<16} {:<24} {:<10}",
+                        lease.client_id,
                         lease.ip_address,
                         lease.expires_at.format("%Y-%m-%d %H:%M:%S UTC"),
                         remaining_str
@@ -84,8 +95,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::CleanupLeases => {
-            let lease_manager = dhcplease::LeaseManager::new(config)?;
-            let count = lease_manager.cleanup_expired_leases().await?;
+            let store = dhcplease::Leases::new(Arc::new(config)).await?;
+            let count = store.cleanup_expired_leases().await?;
             println!("Cleaned up {} expired lease(s).", count);
             Ok(())
         }

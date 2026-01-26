@@ -1,19 +1,32 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
 
+const DECLINE_EXPIRATION_SECONDS: i64 = 3600;
+const OFFER_TIMEOUT_SECONDS: u64 = 60;
+const SAVE_INTERVAL_MILLIS: u64 = 5000;
+
+fn encode_client_id(client_id: &[u8]) -> String {
+    client_id
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lease {
     pub ip_address: Ipv4Addr,
-    pub mac_address: String,
+    pub client_id: String,
     pub hostname: Option<String>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -21,13 +34,13 @@ pub struct Lease {
 }
 
 impl Lease {
-    pub fn new(ip_address: Ipv4Addr, mac_address: String, duration_seconds: u32) -> Self {
+    pub fn new(ip_address: Ipv4Addr, client_id: String, duration_seconds: u32) -> Self {
         let now = Utc::now();
         Self {
             ip_address,
-            mac_address,
+            client_id,
             hostname: None,
-            expires_at: now + chrono::Duration::seconds(duration_seconds as i64),
+            expires_at: now + TimeDelta::seconds(duration_seconds as i64),
             created_at: now,
             last_seen: now,
         }
@@ -39,7 +52,7 @@ impl Lease {
 
     pub fn renew(&mut self, duration_seconds: u32) {
         let now = Utc::now();
-        self.expires_at = now + chrono::Duration::seconds(duration_seconds as i64);
+        self.expires_at = now + TimeDelta::seconds(duration_seconds as i64);
         self.last_seen = now;
     }
 
@@ -49,240 +62,585 @@ impl Lease {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingOffer {
+    ip: Ipv4Addr,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LeaseStore {
     pub leases: HashMap<String, Lease>,
-    pub ip_to_mac: HashMap<Ipv4Addr, String>,
-}
-
-impl LeaseStore {
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            let store: LeaseStore = serde_json::from_str(&content)?;
-            Ok(store)
-        } else {
-            Ok(Self::default())
-        }
-    }
-
-    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
-        Ok(())
-    }
+    pub ip_to_client: HashMap<Ipv4Addr, String>,
+    #[serde(default)]
+    pub declined_ips: HashMap<Ipv4Addr, DateTime<Utc>>,
 }
 
 #[derive(Debug)]
-pub struct LeaseManager {
-    store: Arc<RwLock<LeaseStore>>,
-    config: Config,
-    leases_path: String,
+struct InternalState {
+    store: LeaseStore,
+    free_ips: HashSet<Ipv4Addr>,
+    pending_offers: HashMap<String, PendingOffer>,
+    dirty: bool,
+    last_save: Instant,
 }
 
-impl LeaseManager {
-    pub fn new(config: Config) -> Result<Self> {
+#[derive(Debug)]
+pub struct Leases {
+    state: Arc<RwLock<InternalState>>,
+    config: Arc<Config>,
+    leases_path: String,
+    static_mac_to_ip: HashMap<String, Ipv4Addr>,
+    static_ip_to_mac: HashMap<Ipv4Addr, String>,
+    save_lock: Arc<Mutex<()>>,
+}
+
+impl Leases {
+    pub async fn new(config: Arc<Config>) -> Result<Self> {
         let leases_path = config.leases_file.clone();
-        let store = LeaseStore::load(&leases_path)?;
+        let store = Self::load_store(&leases_path).await?;
+
+        let mut static_mac_to_ip = HashMap::new();
+        let mut static_ip_to_mac = HashMap::new();
+        for binding in &config.static_bindings {
+            let normalized = Self::normalize_static_mac(&binding.mac_address);
+            static_mac_to_ip.insert(normalized.clone(), binding.ip_address);
+            static_ip_to_mac.insert(binding.ip_address, normalized);
+        }
+
+        let mut free_ips = HashSet::new();
+        let start = u32::from(config.pool_start);
+        let end = u32::from(config.pool_end);
+        for ip_num in start..=end {
+            let ip = Ipv4Addr::from(ip_num);
+            if !store.ip_to_client.contains_key(&ip) && !static_ip_to_mac.contains_key(&ip) {
+                free_ips.insert(ip);
+            }
+        }
+
+        let state = InternalState {
+            store,
+            free_ips,
+            pending_offers: HashMap::new(),
+            dirty: false,
+            last_save: Instant::now(),
+        };
 
         Ok(Self {
-            store: Arc::new(RwLock::new(store)),
+            state: Arc::new(RwLock::new(state)),
             config,
             leases_path,
+            static_mac_to_ip,
+            static_ip_to_mac,
+            save_lock: Arc::new(Mutex::new(())),
         })
     }
 
-    pub async fn get_lease(&self, mac_address: &str) -> Option<Lease> {
-        let store = self.store.read().await;
-        store.leases.get(mac_address).cloned()
+    async fn load_store<P: AsRef<Path>>(path: P) -> Result<LeaseStore> {
+        let path = path.as_ref();
+        if path.exists() {
+            let content = tokio::fs::read_to_string(path).await?;
+            let store: LeaseStore = serde_json::from_str(&content)?;
+            Ok(store)
+        } else {
+            Ok(LeaseStore::default())
+        }
+    }
+
+    fn normalize_static_mac(mac: &str) -> String {
+        let mut id = vec![1u8];
+        let normalized = mac.to_lowercase().replace('-', ":");
+        for part in normalized.split(':') {
+            if let Ok(byte) = u8::from_str_radix(part, 16) {
+                id.push(byte);
+            }
+        }
+        encode_client_id(&id)
+    }
+
+    fn client_id_to_static_key(client_id: &[u8]) -> Option<String> {
+        if client_id.len() == 7 && client_id[0] == 1 {
+            Some(encode_client_id(client_id))
+        } else {
+            None
+        }
+    }
+
+    pub async fn get_lease(&self, client_id: &[u8]) -> Option<Lease> {
+        let key = encode_client_id(client_id);
+        let state = self.state.read().await;
+        state.store.leases.get(&key).cloned()
     }
 
     pub async fn get_lease_by_ip(&self, ip: Ipv4Addr) -> Option<Lease> {
-        let store = self.store.read().await;
-        store
-            .ip_to_mac
+        let state = self.state.read().await;
+        state
+            .store
+            .ip_to_client
             .get(&ip)
-            .and_then(|mac| store.leases.get(mac).cloned())
+            .and_then(|client| state.store.leases.get(client).cloned())
     }
 
-    pub async fn allocate_ip(&self, mac_address: &str) -> Result<Ipv4Addr> {
-        for binding in &self.config.static_bindings {
-            if binding.mac_address.to_lowercase() == mac_address.to_lowercase() {
-                return Ok(binding.ip_address);
-            }
-        }
+    pub async fn allocate_ip(&self, client_id: &[u8]) -> Result<Ipv4Addr> {
+        let key = encode_client_id(client_id);
 
+        if let Some(static_key) = Self::client_id_to_static_key(client_id)
+            && let Some(&ip) = self.static_mac_to_ip.get(&static_key)
         {
-            let store = self.store.read().await;
-            if let Some(lease) = store.leases.get(mac_address) {
-                if !lease.is_expired() && self.config.ip_in_pool(lease.ip_address) {
-                    return Ok(lease.ip_address);
-                }
+            return Ok(ip);
+        }
+
+        let mut state = self.state.write().await;
+
+        self.cleanup_pending_offers(&mut state);
+
+        if let Some(lease) = state.store.leases.get(&key)
+            && !lease.is_expired()
+            && self.config.ip_in_pool(lease.ip_address)
+        {
+            return Ok(lease.ip_address);
+        }
+
+        if let Some(offer) = state.pending_offers.get(&key)
+            && offer.expires_at > Instant::now()
+        {
+            return Ok(offer.ip);
+        }
+
+        self.cleanup_expired_internal(&mut state);
+
+        let now = Utc::now();
+        let expired_declined: Vec<Ipv4Addr> = state
+            .store
+            .declined_ips
+            .iter()
+            .filter(|(_, declined_at)| {
+                now.signed_duration_since(**declined_at).num_seconds() >= DECLINE_EXPIRATION_SECONDS
+            })
+            .map(|(ip, _)| *ip)
+            .collect();
+
+        for ip in expired_declined {
+            state.store.declined_ips.remove(&ip);
+            if self.config.ip_in_pool(ip) && !self.static_ip_to_mac.contains_key(&ip) {
+                state.free_ips.insert(ip);
             }
         }
 
-        let mut store = self.store.write().await;
+        let mut sorted_free: Vec<Ipv4Addr> = state.free_ips.iter().copied().collect();
+        sorted_free.sort_by_key(|ip| u32::from(*ip));
 
-        self.cleanup_expired_leases_internal(&mut store);
+        for ip in sorted_free {
+            if !state.store.declined_ips.contains_key(&ip) {
+                let is_pending = state
+                    .pending_offers
+                    .values()
+                    .any(|offer| offer.ip == ip && offer.expires_at > Instant::now());
 
-        let start = u32::from(self.config.pool_start);
-        let end = u32::from(self.config.pool_end);
-
-        for ip_num in start..=end {
-            let ip = Ipv4Addr::from(ip_num);
-
-            let is_static = self
-                .config
-                .static_bindings
-                .iter()
-                .any(|binding| binding.ip_address == ip);
-            if is_static {
-                continue;
-            }
-
-            if !store.ip_to_mac.contains_key(&ip) {
-                return Ok(ip);
+                if !is_pending {
+                    state.pending_offers.insert(
+                        key,
+                        PendingOffer {
+                            ip,
+                            expires_at: Instant::now() + Duration::from_secs(OFFER_TIMEOUT_SECONDS),
+                        },
+                    );
+                    return Ok(ip);
+                }
             }
         }
 
         Err(Error::PoolExhausted)
     }
 
-    pub async fn create_lease(&self, mac_address: &str, ip_address: Ipv4Addr) -> Result<Lease> {
+    fn cleanup_pending_offers(&self, state: &mut InternalState) {
+        let now = Instant::now();
+        state
+            .pending_offers
+            .retain(|_, offer| offer.expires_at > now);
+    }
+
+    pub async fn create_lease(
+        &self,
+        client_id: &[u8],
+        ip_address: Ipv4Addr,
+        hostname: Option<String>,
+    ) -> Result<Lease> {
+        let key = encode_client_id(client_id);
+        let mut state = self.state.write().await;
+
         if !self.config.ip_in_pool(ip_address) {
-            let is_static = self
-                .config
-                .static_bindings
-                .iter()
-                .any(|binding| binding.ip_address == ip_address);
-            if !is_static {
+            if let Some(static_key) = Self::client_id_to_static_key(client_id) {
+                match self.static_ip_to_mac.get(&ip_address) {
+                    Some(bound_key) if *bound_key == static_key => {}
+                    Some(_) => {
+                        return Err(Error::InvalidPacket(
+                            "Static IP belongs to different MAC".to_string(),
+                        ));
+                    }
+                    None => {
+                        return Err(Error::AddressOutOfRange(ip_address));
+                    }
+                }
+            } else {
                 return Err(Error::AddressOutOfRange(ip_address));
             }
         }
 
-        let lease = Lease::new(
-            ip_address,
-            mac_address.to_string(),
-            self.config.lease_duration_seconds,
-        );
-
-        let mut store = self.store.write().await;
-
-        let old_ip_to_remove = store
-            .leases
-            .get(mac_address)
-            .filter(|old_lease| old_lease.ip_address != ip_address)
-            .map(|old_lease| old_lease.ip_address);
-
-        if let Some(old_ip) = old_ip_to_remove {
-            store.ip_to_mac.remove(&old_ip);
+        if let Some(existing_client) = state.store.ip_to_client.get(&ip_address)
+            && *existing_client != key
+            && let Some(existing_lease) = state.store.leases.get(existing_client)
+            && !existing_lease.is_expired()
+        {
+            return Err(Error::InvalidPacket("IP already leased".to_string()));
         }
 
-        store.leases.insert(mac_address.to_string(), lease.clone());
-        store.ip_to_mac.insert(ip_address, mac_address.to_string());
+        state.pending_offers.remove(&key);
 
-        drop(store);
-        self.save().await?;
+        let mut lease = Lease::new(ip_address, key.clone(), self.config.lease_duration_seconds);
+        lease.hostname = hostname;
+
+        let old_ip = state
+            .store
+            .leases
+            .get(&key)
+            .filter(|old| old.ip_address != ip_address)
+            .map(|old| old.ip_address);
+
+        if let Some(old_ip) = old_ip {
+            state.store.ip_to_client.remove(&old_ip);
+            if self.config.ip_in_pool(old_ip) && !self.static_ip_to_mac.contains_key(&old_ip) {
+                state.free_ips.insert(old_ip);
+            }
+        }
+
+        state.store.leases.insert(key.clone(), lease.clone());
+        state.store.ip_to_client.insert(ip_address, key);
+        state.free_ips.remove(&ip_address);
+        state.dirty = true;
+
+        self.maybe_save(&mut state).await?;
 
         Ok(lease)
     }
 
-    pub async fn renew_lease(&self, mac_address: &str) -> Result<Lease> {
-        let mut store = self.store.write().await;
+    pub async fn renew_lease(&self, client_id: &[u8]) -> Result<Lease> {
+        let key = encode_client_id(client_id);
+        let mut state = self.state.write().await;
 
-        let lease = store
+        let lease = state
+            .store
             .leases
-            .get_mut(mac_address)
-            .ok_or_else(|| Error::LeaseNotFound(mac_address.to_string()))?;
+            .get_mut(&key)
+            .ok_or_else(|| Error::LeaseNotFound(key.clone()))?;
 
         lease.renew(self.config.lease_duration_seconds);
         let lease = lease.clone();
+        state.dirty = true;
 
-        drop(store);
-        self.save().await?;
+        self.maybe_save(&mut state).await?;
 
         Ok(lease)
     }
 
-    pub async fn release_lease(&self, mac_address: &str) -> Result<()> {
-        let mut store = self.store.write().await;
+    pub async fn release_lease(&self, client_id: &[u8], ciaddr: Ipv4Addr) -> Result<()> {
+        let key = encode_client_id(client_id);
+        let mut state = self.state.write().await;
 
-        if let Some(lease) = store.leases.remove(mac_address) {
-            store.ip_to_mac.remove(&lease.ip_address);
+        if let Some(lease) = state.store.leases.get(&key)
+            && lease.ip_address != ciaddr
+        {
+            return Err(Error::InvalidPacket(
+                "RELEASE ciaddr does not match lease".to_string(),
+            ));
         }
 
-        drop(store);
-        self.save().await?;
+        if let Some(lease) = state.store.leases.remove(&key) {
+            state.store.ip_to_client.remove(&lease.ip_address);
+            if self.config.ip_in_pool(lease.ip_address)
+                && !self.static_ip_to_mac.contains_key(&lease.ip_address)
+            {
+                state.free_ips.insert(lease.ip_address);
+            }
+            state.dirty = true;
+        }
+
+        self.maybe_save(&mut state).await?;
 
         Ok(())
     }
 
-    pub async fn is_ip_available(&self, ip: Ipv4Addr, requesting_mac: &str) -> bool {
-        let store = self.store.read().await;
+    pub async fn is_ip_available(&self, ip: Ipv4Addr, client_id: &[u8]) -> bool {
+        let key = encode_client_id(client_id);
+        let mut state = self.state.write().await;
 
-        match store.ip_to_mac.get(&ip) {
+        if let Some(declined_at) = state.store.declined_ips.get(&ip) {
+            let now = Utc::now();
+            if now.signed_duration_since(*declined_at).num_seconds() < DECLINE_EXPIRATION_SECONDS {
+                return false;
+            }
+            state.store.declined_ips.remove(&ip);
+            if self.config.ip_in_pool(ip) && !self.static_ip_to_mac.contains_key(&ip) {
+                state.free_ips.insert(ip);
+            }
+        }
+
+        let is_pending = state.pending_offers.iter().any(|(pending_key, offer)| {
+            offer.ip == ip && *pending_key != key && offer.expires_at > Instant::now()
+        });
+
+        if is_pending {
+            return false;
+        }
+
+        match state.store.ip_to_client.get(&ip) {
             None => true,
-            Some(mac) => mac.to_lowercase() == requesting_mac.to_lowercase(),
+            Some(client) => *client == key,
         }
     }
 
-    pub async fn cleanup_expired_leases(&self) -> Result<usize> {
-        let mut store = self.store.write().await;
-        let count = self.cleanup_expired_leases_internal(&mut store);
+    pub async fn decline_ip(&self, ip: Ipv4Addr, client_id: &[u8]) -> Result<bool> {
+        let key = encode_client_id(client_id);
+        let mut state = self.state.write().await;
 
-        drop(store);
-        self.save().await?;
+        let can_decline = match state.store.ip_to_client.get(&ip) {
+            None => self.config.ip_in_pool(ip),
+            Some(leased_client) => *leased_client == key,
+        };
+
+        if !can_decline {
+            return Ok(false);
+        }
+
+        state.store.declined_ips.insert(ip, Utc::now());
+        state.free_ips.remove(&ip);
+
+        let should_remove = state
+            .store
+            .leases
+            .get(&key)
+            .is_some_and(|lease| lease.ip_address == ip);
+
+        if should_remove {
+            state.store.leases.remove(&key);
+            state.store.ip_to_client.remove(&ip);
+        }
+
+        state.dirty = true;
+        self.maybe_save(&mut state).await?;
+
+        Ok(true)
+    }
+
+    pub async fn cleanup_expired_leases(&self) -> Result<usize> {
+        let mut state = self.state.write().await;
+        let count = self.cleanup_expired_internal(&mut state);
+
+        if count > 0 {
+            state.dirty = true;
+            drop(state);
+            self.save().await?;
+        }
 
         Ok(count)
     }
 
-    fn cleanup_expired_leases_internal(&self, store: &mut LeaseStore) -> usize {
-        let expired_macs: Vec<String> = store
+    fn cleanup_expired_internal(&self, state: &mut InternalState) -> usize {
+        let expired_clients: Vec<String> = state
+            .store
             .leases
             .iter()
             .filter(|(_, lease)| lease.is_expired())
-            .map(|(mac, _)| mac.clone())
+            .map(|(client, _)| client.clone())
             .collect();
 
-        let count = expired_macs.len();
+        let count = expired_clients.len();
 
-        for mac in expired_macs {
-            if let Some(lease) = store.leases.remove(&mac) {
-                store.ip_to_mac.remove(&lease.ip_address);
+        for client in expired_clients {
+            if let Some(lease) = state.store.leases.remove(&client) {
+                state.store.ip_to_client.remove(&lease.ip_address);
+                if self.config.ip_in_pool(lease.ip_address)
+                    && !self.static_ip_to_mac.contains_key(&lease.ip_address)
+                {
+                    state.free_ips.insert(lease.ip_address);
+                }
             }
         }
 
         count
     }
 
+    async fn maybe_save(&self, state: &mut InternalState) -> Result<()> {
+        if state.dirty && state.last_save.elapsed().as_millis() >= SAVE_INTERVAL_MILLIS as u128 {
+            let store_clone = state.store.clone();
+            state.dirty = false;
+            state.last_save = Instant::now();
+
+            let _lock = self.save_lock.lock().await;
+            let content = serde_json::to_string_pretty(&store_clone)?;
+            tokio::fs::write(&self.leases_path, content).await?;
+        }
+        Ok(())
+    }
+
     pub async fn save(&self) -> Result<()> {
-        let store = self.store.read().await;
-        store.save(&self.leases_path)?;
+        let state = self.state.read().await;
+        let store_clone = state.store.clone();
+        drop(state);
+
+        let _lock = self.save_lock.lock().await;
+        let content = serde_json::to_string_pretty(&store_clone)?;
+        tokio::fs::write(&self.leases_path, content).await?;
+
+        let mut state = self.state.write().await;
+        state.dirty = false;
+        state.last_save = Instant::now();
+
         Ok(())
     }
 
     pub async fn list_leases(&self) -> Vec<Lease> {
-        let store = self.store.read().await;
-        store.leases.values().cloned().collect()
+        let state = self.state.read().await;
+        state.store.leases.values().cloned().collect()
     }
 
     pub async fn active_lease_count(&self) -> usize {
-        let store = self.store.read().await;
-        store
+        let state = self.state.read().await;
+        state
+            .store
             .leases
             .values()
             .filter(|lease| !lease.is_expired())
             .count()
+    }
+
+    pub async fn free_ip_count(&self) -> usize {
+        let state = self.state.read().await;
+        state.free_ips.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StaticBinding;
 
-    fn test_config(test_name: &str) -> Config {
-        Config {
+    struct TestGuard(String);
+    impl Drop for TestGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn test_config(name: &str) -> (Arc<Config>, TestGuard) {
+        let path = format!("test_leases_{}.json", name);
+        (
+            Arc::new(Config {
+                server_ip: Ipv4Addr::new(192, 168, 1, 1),
+                subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+                pool_start: Ipv4Addr::new(192, 168, 1, 100),
+                pool_end: Ipv4Addr::new(192, 168, 1, 110),
+                gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8)],
+                domain_name: None,
+                lease_duration_seconds: 3600,
+                renewal_time_seconds: None,
+                rebinding_time_seconds: None,
+                broadcast_address: None,
+                mtu: None,
+                static_bindings: vec![],
+                leases_file: path.clone(),
+                interface_index: None,
+            }),
+            TestGuard(path),
+        )
+    }
+
+    fn make_client_id(mac: &[u8; 6]) -> Vec<u8> {
+        let mut id = vec![1u8];
+        id.extend_from_slice(mac);
+        id
+    }
+
+    #[test]
+    fn test_lease_struct() {
+        let lease = Lease::new(Ipv4Addr::new(192, 168, 1, 100), "test".to_string(), 3600);
+        assert!(!lease.is_expired());
+        assert!(lease.remaining_seconds() > 3500);
+
+        let mut expired = Lease::new(Ipv4Addr::new(192, 168, 1, 100), "test".to_string(), 0);
+        expired.expires_at = Utc::now() - TimeDelta::seconds(1);
+        assert!(expired.is_expired());
+
+        let mut renewable = Lease::new(Ipv4Addr::new(192, 168, 1, 100), "test".to_string(), 100);
+        renewable.renew(7200);
+        assert!(renewable.remaining_seconds() > 7100);
+    }
+
+    #[tokio::test]
+    async fn test_lease_lifecycle() {
+        let (config, _guard) = test_config("lifecycle");
+        let manager = Leases::new(config).await.unwrap();
+        let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+
+        let ip = manager.allocate_ip(&client_id).await.unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 100));
+
+        let lease = manager
+            .create_lease(&client_id, ip, Some("test-host".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(lease.hostname, Some("test-host".to_string()));
+
+        assert!(manager.get_lease(&client_id).await.is_some());
+        assert!(manager.get_lease_by_ip(ip).await.is_some());
+        assert_eq!(manager.active_lease_count().await, 1);
+
+        let renewed = manager.renew_lease(&client_id).await.unwrap();
+        assert_eq!(renewed.ip_address, ip);
+
+        manager.release_lease(&client_id, ip).await.unwrap();
+        assert!(manager.get_lease(&client_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ip_allocation() {
+        let (config, _guard) = test_config("allocation");
+        let manager = Leases::new(config).await.unwrap();
+        let client1 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
+
+        let ip1 = manager.allocate_ip(&client1).await.unwrap();
+        manager.create_lease(&client1, ip1, None).await.unwrap();
+
+        let ip2 = manager.allocate_ip(&client2).await.unwrap();
+        assert_ne!(ip1, ip2);
+
+        let ip1_again = manager.allocate_ip(&client1).await.unwrap();
+        assert_eq!(ip1, ip1_again);
+    }
+
+    #[tokio::test]
+    async fn test_decline_and_availability() {
+        let (config, _guard) = test_config("decline");
+        let manager = Leases::new(config).await.unwrap();
+        let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+
+        let ip = Ipv4Addr::new(192, 168, 1, 100);
+        assert!(manager.is_ip_available(ip, &client_id).await);
+
+        assert!(manager.decline_ip(ip, &client_id).await.unwrap());
+        assert!(!manager.is_ip_available(ip, &client_id).await);
+
+        let allocated = manager.allocate_ip(&client_id).await.unwrap();
+        assert_eq!(allocated, Ipv4Addr::new(192, 168, 1, 101));
+    }
+
+    #[tokio::test]
+    async fn test_static_binding() {
+        let path = "test_leases_static.json".to_string();
+        let _guard = TestGuard(path.clone());
+        let config = Arc::new(Config {
             server_ip: Ipv4Addr::new(192, 168, 1, 1),
             subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
             pool_start: Ipv4Addr::new(192, 168, 1, 100),
@@ -295,74 +653,99 @@ mod tests {
             rebinding_time_seconds: None,
             broadcast_address: None,
             mtu: None,
-            static_bindings: vec![],
-            leases_file: format!("test_leases_{}.json", test_name),
+            static_bindings: vec![StaticBinding {
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                ip_address: Ipv4Addr::new(192, 168, 1, 50),
+                hostname: None,
+            }],
+            leases_file: path,
             interface_index: None,
+        });
+        let manager = Leases::new(config).await.unwrap();
+        let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+
+        let ip = manager.allocate_ip(&client_id).await.unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 50));
+    }
+
+    #[tokio::test]
+    async fn test_offer_tracking() {
+        let (config, _guard) = test_config("offers");
+        let manager = Leases::new(config).await.unwrap();
+        let client1 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
+
+        let ip1 = manager.allocate_ip(&client1).await.unwrap();
+        let ip2 = manager.allocate_ip(&client2).await.unwrap();
+
+        assert_ne!(ip1, ip2);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_allocations() {
+        let (config, _guard) = test_config("concurrent");
+        let leases = Arc::new(Leases::new(config).await.unwrap());
+
+        let mut handles = vec![];
+        for index in 0..5 {
+            let leases_clone = Arc::clone(&leases);
+            let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, index]);
+            handles.push(tokio::spawn(async move {
+                let ip = leases_clone.allocate_ip(&client_id).await?;
+                leases_clone.create_lease(&client_id, ip, None).await?;
+                Ok::<_, crate::error::Error>(ip)
+            }));
         }
-    }
 
-    #[test]
-    fn test_lease_creation() {
-        let lease = Lease::new(
-            Ipv4Addr::new(192, 168, 1, 100),
-            "aa:bb:cc:dd:ee:ff".to_string(),
-            3600,
-        );
+        let mut allocated_ips = std::collections::HashSet::new();
+        for handle in handles {
+            let ip = handle.await.unwrap().unwrap();
+            assert!(allocated_ips.insert(ip), "Duplicate IP allocated: {}", ip);
+        }
 
-        assert!(!lease.is_expired());
-        assert!(lease.remaining_seconds() > 3500);
-    }
-
-    #[test]
-    fn test_lease_expiration() {
-        let mut lease = Lease::new(
-            Ipv4Addr::new(192, 168, 1, 100),
-            "aa:bb:cc:dd:ee:ff".to_string(),
-            0,
-        );
-
-        lease.expires_at = Utc::now() - chrono::Duration::seconds(1);
-        assert!(lease.is_expired());
+        assert_eq!(allocated_ips.len(), 5);
     }
 
     #[tokio::test]
-    async fn test_lease_manager_allocate() {
-        let leases_file = "test_leases_allocate.json";
-        let config = test_config("allocate");
-        let manager = LeaseManager::new(config).unwrap();
+    async fn test_concurrent_create_and_release() {
+        let (config, _guard) = test_config("concurrent_cr");
+        let leases = Arc::new(Leases::new(config).await.unwrap());
+        let client1 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
 
-        let ip1 = manager.allocate_ip("aa:bb:cc:dd:ee:01").await.unwrap();
-        assert_eq!(ip1, Ipv4Addr::new(192, 168, 1, 100));
+        let ip = leases.allocate_ip(&client1).await.unwrap();
+        leases.create_lease(&client1, ip, None).await.unwrap();
 
-        manager
-            .create_lease("aa:bb:cc:dd:ee:01", ip1)
-            .await
-            .unwrap();
+        let leases_clone = Arc::clone(&leases);
+        let client1_clone = client1.clone();
+        let release_handle =
+            tokio::spawn(async move { leases_clone.release_lease(&client1_clone, ip).await });
 
-        let ip2 = manager.allocate_ip("aa:bb:cc:dd:ee:02").await.unwrap();
-        assert_eq!(ip2, Ipv4Addr::new(192, 168, 1, 101));
+        let allocate_handle = {
+            let leases_clone = Arc::clone(&leases);
+            tokio::spawn(async move { leases_clone.allocate_ip(&client2).await })
+        };
 
-        let ip1_again = manager.allocate_ip("aa:bb:cc:dd:ee:01").await.unwrap();
-        assert_eq!(ip1_again, ip1);
-
-        let _ = std::fs::remove_file(leases_file);
+        release_handle.await.unwrap().unwrap();
+        let ip2 = allocate_handle.await.unwrap().unwrap();
+        assert!(ip2 >= Ipv4Addr::new(192, 168, 1, 100) && ip2 <= Ipv4Addr::new(192, 168, 1, 110));
     }
 
     #[tokio::test]
-    async fn test_lease_manager_release() {
-        let leases_file = "test_leases_release.json";
-        let config = test_config("release");
-        let manager = LeaseManager::new(config).unwrap();
+    async fn test_free_ip_tracking() {
+        let (config, _guard) = test_config("free_ips");
+        let manager = Leases::new(config).await.unwrap();
+        let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
-        let ip = manager.allocate_ip("aa:bb:cc:dd:ee:ff").await.unwrap();
-        manager.create_lease("aa:bb:cc:dd:ee:ff", ip).await.unwrap();
+        assert_eq!(manager.free_ip_count().await, 11);
 
-        assert!(manager.get_lease("aa:bb:cc:dd:ee:ff").await.is_some());
+        let ip = manager.allocate_ip(&client_id).await.unwrap();
+        manager.create_lease(&client_id, ip, None).await.unwrap();
 
-        manager.release_lease("aa:bb:cc:dd:ee:ff").await.unwrap();
+        assert_eq!(manager.free_ip_count().await, 10);
 
-        assert!(manager.get_lease("aa:bb:cc:dd:ee:ff").await.is_none());
+        manager.release_lease(&client_id, ip).await.unwrap();
 
-        let _ = std::fs::remove_file(leases_file);
+        assert_eq!(manager.free_ip_count().await, 11);
     }
 }

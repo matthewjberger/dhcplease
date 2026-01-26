@@ -1,9 +1,50 @@
 use std::net::Ipv4Addr;
 
 use crate::error::{Error, Result};
-use crate::options::{DhcpOption, MessageType, OptionCode};
+use crate::options::{DhcpOption, MessageType, OptionCode, OverloadFlag};
 
 const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
+const DHCP_OP_HTYPE_HLEN_HOPS_SIZE: usize = 4;
+const DHCP_XID_SIZE: usize = 4;
+const DHCP_SECS_SIZE: usize = 2;
+const DHCP_FLAGS_SIZE: usize = 2;
+const DHCP_CIADDR_SIZE: usize = 4;
+const DHCP_YIADDR_SIZE: usize = 4;
+const DHCP_SIADDR_SIZE: usize = 4;
+const DHCP_GIADDR_SIZE: usize = 4;
+const DHCP_CHADDR_SIZE: usize = 16;
+const DHCP_SNAME_SIZE: usize = 64;
+const DHCP_FILE_SIZE: usize = 128;
+
+const DHCP_MAGIC_COOKIE_OFFSET: usize = DHCP_OP_HTYPE_HLEN_HOPS_SIZE
+    + DHCP_XID_SIZE
+    + DHCP_SECS_SIZE
+    + DHCP_FLAGS_SIZE
+    + DHCP_CIADDR_SIZE
+    + DHCP_YIADDR_SIZE
+    + DHCP_SIADDR_SIZE
+    + DHCP_GIADDR_SIZE
+    + DHCP_CHADDR_SIZE
+    + DHCP_SNAME_SIZE
+    + DHCP_FILE_SIZE;
+
+const DHCP_SNAME_OFFSET: usize = DHCP_OP_HTYPE_HLEN_HOPS_SIZE
+    + DHCP_XID_SIZE
+    + DHCP_SECS_SIZE
+    + DHCP_FLAGS_SIZE
+    + DHCP_CIADDR_SIZE
+    + DHCP_YIADDR_SIZE
+    + DHCP_SIADDR_SIZE
+    + DHCP_GIADDR_SIZE
+    + DHCP_CHADDR_SIZE;
+
+const DHCP_FILE_OFFSET: usize = DHCP_SNAME_OFFSET + DHCP_SNAME_SIZE;
+
+const DHCP_FIXED_HEADER_SIZE: usize = DHCP_MAGIC_COOKIE_OFFSET + DHCP_MAGIC_COOKIE.len();
+const DHCP_MIN_PACKET_SIZE: usize = 300;
+const DHCP_ENCODE_CAPACITY: usize = 576;
+const MAX_HOPS: u8 = 16;
+
 pub const BOOTREQUEST: u8 = 1;
 pub const BOOTREPLY: u8 = 2;
 pub const HTYPE_ETHERNET: u8 = 1;
@@ -30,14 +71,16 @@ pub struct DhcpPacket {
 
 impl DhcpPacket {
     pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < 240 {
+        if data.len() < DHCP_FIXED_HEADER_SIZE {
             return Err(Error::InvalidPacket(format!(
-                "Packet too short: {} bytes (minimum 240)",
-                data.len()
+                "Packet too short: {} bytes (minimum {})",
+                data.len(),
+                DHCP_FIXED_HEADER_SIZE
             )));
         }
 
-        let magic_cookie = &data[236..240];
+        let magic_cookie_end = DHCP_MAGIC_COOKIE_OFFSET + DHCP_MAGIC_COOKIE.len();
+        let magic_cookie = &data[DHCP_MAGIC_COOKIE_OFFSET..magic_cookie_end];
         if magic_cookie != DHCP_MAGIC_COOKIE {
             return Err(Error::InvalidPacket("Invalid magic cookie".to_string()));
         }
@@ -46,6 +89,20 @@ impl DhcpPacket {
         let htype = data[1];
         let hlen = data[2];
         let hops = data[3];
+
+        if hops > MAX_HOPS {
+            return Err(Error::InvalidPacket(format!(
+                "Hop count {} exceeds maximum {}",
+                hops, MAX_HOPS
+            )));
+        }
+
+        if htype == HTYPE_ETHERNET && hlen != HLEN_ETHERNET {
+            return Err(Error::InvalidPacket(format!(
+                "Invalid hlen {} for Ethernet (expected {})",
+                hlen, HLEN_ETHERNET
+            )));
+        }
 
         let xid = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let secs = u16::from_be_bytes([data[8], data[9]]);
@@ -60,12 +117,31 @@ impl DhcpPacket {
         chaddr.copy_from_slice(&data[28..44]);
 
         let mut sname = [0u8; 64];
-        sname.copy_from_slice(&data[44..108]);
+        sname.copy_from_slice(&data[DHCP_SNAME_OFFSET..DHCP_SNAME_OFFSET + DHCP_SNAME_SIZE]);
 
         let mut file = [0u8; 128];
-        file.copy_from_slice(&data[108..236]);
+        file.copy_from_slice(&data[DHCP_FILE_OFFSET..DHCP_FILE_OFFSET + DHCP_FILE_SIZE]);
 
-        let options = Self::parse_options(&data[240..])?;
+        let mut options = Self::parse_options(&data[DHCP_FIXED_HEADER_SIZE..])?;
+
+        let overload = options.iter().find_map(|opt| {
+            if let DhcpOption::OptionOverload(flag) = opt {
+                Some(*flag)
+            } else {
+                None
+            }
+        });
+
+        if let Some(flag) = overload {
+            if matches!(flag, OverloadFlag::File | OverloadFlag::Both) {
+                let file_options = Self::parse_options(&file)?;
+                options.extend(file_options);
+            }
+            if matches!(flag, OverloadFlag::Sname | OverloadFlag::Both) {
+                let sname_options = Self::parse_options(&sname)?;
+                options.extend(sname_options);
+            }
+        }
 
         Ok(Self {
             op,
@@ -123,7 +199,7 @@ impl DhcpPacket {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut packet = Vec::with_capacity(576);
+        let mut packet = Vec::with_capacity(DHCP_ENCODE_CAPACITY);
 
         packet.push(self.op);
         packet.push(self.htype);
@@ -151,7 +227,7 @@ impl DhcpPacket {
 
         packet.push(OptionCode::End as u8);
 
-        while packet.len() < 300 {
+        while packet.len() < DHCP_MIN_PACKET_SIZE {
             packet.push(0);
         }
 
@@ -185,21 +261,53 @@ impl DhcpPacket {
         None
     }
 
-    pub fn client_identifier(&self) -> Option<Vec<u8>> {
+    pub fn client_identifier(&self) -> Option<&[u8]> {
         for option in &self.options {
             if let DhcpOption::ClientIdentifier(id) = option {
-                return Some(id.clone());
+                return Some(id);
             }
         }
         None
     }
 
-    pub fn mac_address(&self) -> String {
+    pub fn relay_agent_info(&self) -> Option<&[u8]> {
+        for option in &self.options {
+            if let DhcpOption::RelayAgentInfo(info) = option {
+                return Some(info);
+            }
+        }
+        None
+    }
+
+    pub fn hostname(&self) -> Option<&str> {
+        for option in &self.options {
+            if let DhcpOption::Hostname(name) = option {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    pub fn chaddr_bytes(&self) -> &[u8] {
+        &self.chaddr[..self.hlen as usize]
+    }
+
+    pub fn format_mac(&self) -> String {
         self.chaddr[..6]
             .iter()
             .map(|byte| format!("{:02x}", byte))
             .collect::<Vec<_>>()
             .join(":")
+    }
+
+    pub fn client_id(&self) -> Vec<u8> {
+        if let Some(id) = self.client_identifier() {
+            id.to_vec()
+        } else {
+            let mut id = vec![self.htype];
+            id.extend_from_slice(self.chaddr_bytes());
+            id
+        }
     }
 
     pub fn is_broadcast(&self) -> bool {
@@ -218,8 +326,8 @@ impl DhcpPacket {
 
         Self {
             op: BOOTREPLY,
-            htype: HTYPE_ETHERNET,
-            hlen: HLEN_ETHERNET,
+            htype: request.htype,
+            hlen: request.hlen,
             hops: 0,
             xid: request.xid,
             secs: 0,
@@ -240,61 +348,68 @@ impl DhcpPacket {
 mod tests {
     use super::*;
 
-    fn create_test_discover_packet() -> Vec<u8> {
-        let mut packet = vec![0u8; 300];
+    fn create_test_packet(message_type: MessageType, with_options: bool) -> Vec<u8> {
+        let mut packet = vec![0u8; 350];
 
         packet[0] = BOOTREQUEST;
         packet[1] = HTYPE_ETHERNET;
         packet[2] = HLEN_ETHERNET;
-        packet[3] = 0;
-
         packet[4..8].copy_from_slice(&0x12345678u32.to_be_bytes());
-        packet[8..10].copy_from_slice(&0u16.to_be_bytes());
         packet[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
-
         packet[28..34].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
-
         packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
 
-        packet[240] = OptionCode::MessageType as u8;
-        packet[241] = 1;
-        packet[242] = MessageType::Discover as u8;
+        let mut index = 240;
+        packet[index] = OptionCode::MessageType as u8;
+        packet[index + 1] = 1;
+        packet[index + 2] = message_type as u8;
+        index += 3;
 
-        packet[243] = OptionCode::End as u8;
+        if with_options {
+            packet[index] = OptionCode::RequestedIpAddress as u8;
+            packet[index + 1] = 4;
+            packet[index + 2..index + 6].copy_from_slice(&[192, 168, 1, 100]);
+            index += 6;
 
+            packet[index] = OptionCode::Hostname as u8;
+            packet[index + 1] = 9;
+            packet[index + 2..index + 11].copy_from_slice(b"test-host");
+            index += 11;
+        }
+
+        packet[index] = OptionCode::End as u8;
         packet
     }
 
     #[test]
-    fn test_parse_discover_packet() {
-        let data = create_test_discover_packet();
+    fn test_parse_and_roundtrip() {
+        let data = create_test_packet(MessageType::Discover, false);
         let packet = DhcpPacket::parse(&data).unwrap();
 
         assert_eq!(packet.op, BOOTREQUEST);
-        assert_eq!(packet.htype, HTYPE_ETHERNET);
-        assert_eq!(packet.hlen, HLEN_ETHERNET);
         assert_eq!(packet.xid, 0x12345678);
         assert!(packet.is_broadcast());
         assert_eq!(packet.message_type(), Some(MessageType::Discover));
-        assert_eq!(packet.mac_address(), "aa:bb:cc:dd:ee:ff");
-    }
+        assert_eq!(packet.format_mac(), "aa:bb:cc:dd:ee:ff");
 
-    #[test]
-    fn test_packet_roundtrip() {
-        let original_data = create_test_discover_packet();
-        let packet = DhcpPacket::parse(&original_data).unwrap();
         let encoded = packet.encode();
-
         let reparsed = DhcpPacket::parse(&encoded).unwrap();
-        assert_eq!(reparsed.op, packet.op);
         assert_eq!(reparsed.xid, packet.xid);
-        assert_eq!(reparsed.mac_address(), packet.mac_address());
         assert_eq!(reparsed.message_type(), packet.message_type());
     }
 
     #[test]
+    fn test_parse_with_options() {
+        let data = create_test_packet(MessageType::Request, true);
+        let packet = DhcpPacket::parse(&data).unwrap();
+
+        assert_eq!(packet.requested_ip(), Some(Ipv4Addr::new(192, 168, 1, 100)));
+        assert_eq!(packet.hostname(), Some("test-host"));
+    }
+
+    #[test]
     fn test_create_reply() {
-        let discover_data = create_test_discover_packet();
+        let discover_data = create_test_packet(MessageType::Discover, false);
         let discover = DhcpPacket::parse(&discover_data).unwrap();
 
         let offer = DhcpPacket::create_reply(
@@ -302,28 +417,90 @@ mod tests {
             MessageType::Offer,
             Ipv4Addr::new(192, 168, 1, 100),
             Ipv4Addr::new(192, 168, 1, 1),
-            vec![
-                DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)),
-                DhcpOption::LeaseTime(86400),
-            ],
+            vec![DhcpOption::LeaseTime(86400)],
         );
 
         assert_eq!(offer.op, BOOTREPLY);
         assert_eq!(offer.xid, discover.xid);
         assert_eq!(offer.yiaddr, Ipv4Addr::new(192, 168, 1, 100));
         assert_eq!(offer.message_type(), Some(MessageType::Offer));
+        assert_eq!(offer.chaddr, discover.chaddr);
     }
 
     #[test]
-    fn test_packet_too_short() {
-        let data = vec![0u8; 100];
-        assert!(DhcpPacket::parse(&data).is_err());
+    fn test_invalid_packets() {
+        assert!(DhcpPacket::parse(&[0u8; 100]).is_err());
+        assert!(DhcpPacket::parse(&[0u8; 239]).is_err());
+
+        let mut bad_cookie = [0u8; 300];
+        bad_cookie[236..240].copy_from_slice(&[0, 0, 0, 0]);
+        assert!(DhcpPacket::parse(&bad_cookie).is_err());
     }
 
     #[test]
-    fn test_invalid_magic_cookie() {
-        let mut data = vec![0u8; 300];
-        data[236..240].copy_from_slice(&[0, 0, 0, 0]);
-        assert!(DhcpPacket::parse(&data).is_err());
+    fn test_hlen_validation() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = 7;
+        assert!(DhcpPacket::parse(&packet).is_err());
+
+        packet[2] = HLEN_ETHERNET;
+        assert!(DhcpPacket::parse(&packet).is_ok());
+    }
+
+    #[test]
+    fn test_hops_limit() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+        packet[3] = 17;
+        assert!(DhcpPacket::parse(&packet).is_err());
+
+        packet[3] = 16;
+        assert!(DhcpPacket::parse(&packet).is_ok());
+    }
+
+    #[test]
+    fn test_create_reply_copies_htype() {
+        let mut packet_data = create_test_packet(MessageType::Discover, false);
+        packet_data[1] = 6;
+        packet_data[2] = 8;
+
+        let request = DhcpPacket::parse(&packet_data).unwrap();
+        let reply = DhcpPacket::create_reply(
+            &request,
+            MessageType::Offer,
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 1),
+            vec![],
+        );
+
+        assert_eq!(reply.htype, 6);
+        assert_eq!(reply.hlen, 8);
+    }
+
+    #[test]
+    fn test_client_id_with_option() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+        let mut index = 243;
+        packet[index] = OptionCode::ClientIdentifier as u8;
+        packet[index + 1] = 7;
+        packet[index + 2..index + 9].copy_from_slice(&[1, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        index += 9;
+        packet[index] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(
+            parsed.client_id(),
+            vec![1, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+        );
+    }
+
+    #[test]
+    fn test_client_id_from_chaddr() {
+        let packet = create_test_packet(MessageType::Discover, false);
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(
+            parsed.client_id(),
+            vec![1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        );
     }
 }

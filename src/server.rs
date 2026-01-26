@@ -1,30 +1,39 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::time::Instant;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, sanitize_hostname};
 use crate::error::{Error, Result};
-use crate::lease::LeaseManager;
+use crate::lease::Leases;
 use crate::options::{DhcpOption, MessageType};
-use crate::packet::DhcpPacket;
+use crate::packet::{BOOTREQUEST, DhcpPacket};
 
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
+const RATE_LIMIT_WINDOW_SECS: u64 = 1;
+const RATE_LIMIT_MAX_REQUESTS: usize = 10;
+const RATE_LIMIT_CLEANUP_THRESHOLD: usize = 1000;
+const RECV_BUFFER_SIZE: usize = 1500;
 
 pub struct DhcpServer {
     config: Arc<Config>,
-    lease_manager: Arc<LeaseManager>,
-    socket: UdpSocket,
+    leases: Arc<Leases>,
+    socket: Arc<UdpSocket>,
+    rate_limiter: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
 }
 
 impl DhcpServer {
     pub async fn new(config: Config) -> Result<Self> {
-        let lease_manager = LeaseManager::new(config.clone())?;
+        let config = Arc::new(config);
+        let leases = Arc::new(Leases::new(Arc::clone(&config)).await?);
 
-        let socket = Self::create_socket(&config)?;
+        let socket = Arc::new(Self::create_socket(&config)?);
 
         info!(
             "DHCP server starting on {}:{}",
@@ -38,9 +47,10 @@ impl DhcpServer {
         );
 
         Ok(Self {
-            config: Arc::new(config),
-            lease_manager: Arc::new(lease_manager),
+            config,
+            leases,
             socket,
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -79,6 +89,13 @@ impl DhcpServer {
                     );
                 }
             }
+            #[cfg(not(windows))]
+            {
+                warn!(
+                    "interface_index ({}) is only supported on Windows and will be ignored",
+                    interface_index
+                );
+            }
         }
 
         let std_socket: std::net::UdpSocket = socket.into();
@@ -90,16 +107,30 @@ impl DhcpServer {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let mut buffer = [0u8; 1500];
+        let mut buffer = [0u8; RECV_BUFFER_SIZE];
 
         info!("DHCP server ready and listening");
 
         loop {
             match self.socket.recv_from(&mut buffer).await {
                 Ok((size, source)) => {
-                    if let Err(error) = self.handle_packet(&buffer[..size], source).await {
-                        warn!("Error handling packet from {}: {}", source, error);
-                    }
+                    let data = buffer[..size].to_vec();
+                    let config = Arc::clone(&self.config);
+                    let leases = Arc::clone(&self.leases);
+                    let socket = Arc::clone(&self.socket);
+                    let rate_limiter = Arc::clone(&self.rate_limiter);
+
+                    tokio::spawn(async move {
+                        let handler = PacketHandler {
+                            config,
+                            leases,
+                            socket,
+                            rate_limiter,
+                        };
+                        if let Err(error) = handler.handle_packet(&data, source).await {
+                            warn!("Error handling packet from {}: {}", source, error);
+                        }
+                    });
                 }
                 Err(error) => {
                     error!("Error receiving packet: {}", error);
@@ -108,14 +139,68 @@ impl DhcpServer {
         }
     }
 
+    pub async fn save_leases(&self) -> Result<()> {
+        self.leases.save().await
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn leases(&self) -> &Leases {
+        &self.leases
+    }
+}
+
+struct PacketHandler {
+    config: Arc<Config>,
+    leases: Arc<Leases>,
+    socket: Arc<UdpSocket>,
+    rate_limiter: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+}
+
+impl PacketHandler {
+    async fn is_rate_limited(&self, key: &str) -> bool {
+        let mut limiter = self.rate_limiter.lock().await;
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+
+        if limiter.len() > RATE_LIMIT_CLEANUP_THRESHOLD {
+            limiter.retain(|_, timestamps| {
+                timestamps.retain(|t| now.duration_since(*t) < window);
+                !timestamps.is_empty()
+            });
+        }
+
+        let timestamps = limiter.entry(key.to_string()).or_default();
+        timestamps.retain(|t| now.duration_since(*t) < window);
+
+        if timestamps.len() >= RATE_LIMIT_MAX_REQUESTS {
+            return true;
+        }
+
+        timestamps.push(now);
+        false
+    }
+
     async fn handle_packet(&self, data: &[u8], source: SocketAddr) -> Result<()> {
         let packet = DhcpPacket::parse(data)?;
+
+        if packet.op != BOOTREQUEST {
+            return Err(Error::InvalidPacket("Expected BOOTREQUEST".to_string()));
+        }
+
+        let mac = packet.format_mac();
+
+        if self.is_rate_limited(&mac).await {
+            warn!("Rate limited: {} from {}", mac, source);
+            return Ok(());
+        }
 
         let message_type = packet
             .message_type()
             .ok_or_else(|| Error::InvalidPacket("Missing message type option".to_string()))?;
 
-        let mac = packet.mac_address();
         info!("{} from {} ({})", message_type, mac, source);
 
         match message_type {
@@ -132,19 +217,30 @@ impl DhcpServer {
     }
 
     async fn handle_discover(&self, packet: &DhcpPacket) -> Result<()> {
-        let mac = packet.mac_address();
+        let mac = packet.format_mac();
+        let client_id = packet.client_id();
 
         let offered_ip = match packet.requested_ip() {
             Some(requested_ip)
                 if self.config.ip_in_pool(requested_ip)
-                    && self.lease_manager.is_ip_available(requested_ip, &mac).await =>
+                    && self.leases.is_ip_available(requested_ip, &client_id).await =>
             {
                 requested_ip
             }
-            _ => self.lease_manager.allocate_ip(&mac).await?,
+            _ => match self.leases.allocate_ip(&client_id).await {
+                Ok(ip) => ip,
+                Err(Error::PoolExhausted) => {
+                    warn!("Pool exhausted, cannot offer IP to {}", mac);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            },
         };
 
-        let options = self.build_offer_options(offered_ip);
+        let mut options = self.build_offer_options();
+        if let Some(relay_info) = packet.relay_agent_info() {
+            options.push(DhcpOption::RelayAgentInfo(relay_info.to_vec()));
+        }
 
         let offer = DhcpPacket::create_reply(
             packet,
@@ -162,13 +258,14 @@ impl DhcpServer {
     }
 
     async fn handle_request(&self, packet: &DhcpPacket) -> Result<()> {
-        let mac = packet.mac_address();
+        let mac = packet.format_mac();
+        let client_id = packet.client_id();
 
-        if let Some(server_id) = packet.server_identifier() {
-            if server_id != self.config.server_ip {
-                info!("REQUEST from {} is for different server {}", mac, server_id);
-                return Ok(());
-            }
+        if let Some(server_id) = packet.server_identifier()
+            && server_id != self.config.server_ip
+        {
+            info!("REQUEST from {} is for different server {}", mac, server_id);
+            return Ok(());
         }
 
         let requested_ip = packet
@@ -181,22 +278,65 @@ impl DhcpServer {
             .ok_or_else(|| Error::InvalidPacket("No IP address in REQUEST".to_string()))?;
 
         if !self.config.ip_in_pool(requested_ip)
-            && !self
-                .config
-                .static_bindings
-                .iter()
-                .any(|binding| binding.ip_address == requested_ip)
+            && !self.is_static_binding(&client_id, requested_ip)
         {
             return self.send_nak(packet, "Requested IP not in pool").await;
         }
 
-        if !self.lease_manager.is_ip_available(requested_ip, &mac).await {
-            return self.send_nak(packet, "IP address already in use").await;
+        let existing_lease = self.leases.get_lease(&client_id).await;
+        let is_renewal = existing_lease
+            .as_ref()
+            .is_some_and(|lease| lease.ip_address == requested_ip && !lease.is_expired());
+
+        let hostname = packet.hostname().map(sanitize_hostname);
+        let lease = if is_renewal {
+            match self.leases.renew_lease(&client_id).await {
+                Ok(lease) => lease,
+                Err(Error::LeaseNotFound(_)) => {
+                    match self
+                        .leases
+                        .create_lease(&client_id, requested_ip, hostname)
+                        .await
+                    {
+                        Ok(lease) => lease,
+                        Err(Error::InvalidPacket(msg)) => {
+                            return self.send_nak(packet, &msg).await;
+                        }
+                        Err(Error::AddressOutOfRange(_)) => {
+                            return self.send_nak(packet, "Requested IP not in pool").await;
+                        }
+                        Err(Error::PoolExhausted) => {
+                            return self.send_nak(packet, "Address pool exhausted").await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            match self
+                .leases
+                .create_lease(&client_id, requested_ip, hostname)
+                .await
+            {
+                Ok(lease) => lease,
+                Err(Error::InvalidPacket(msg)) => {
+                    return self.send_nak(packet, &msg).await;
+                }
+                Err(Error::AddressOutOfRange(_)) => {
+                    return self.send_nak(packet, "Requested IP not in pool").await;
+                }
+                Err(Error::PoolExhausted) => {
+                    return self.send_nak(packet, "Address pool exhausted").await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        let mut options = self.build_offer_options();
+        if let Some(relay_info) = packet.relay_agent_info() {
+            options.push(DhcpOption::RelayAgentInfo(relay_info.to_vec()));
         }
-
-        let lease = self.lease_manager.create_lease(&mac, requested_ip).await?;
-
-        let options = self.build_ack_options(&lease);
 
         let ack = DhcpPacket::create_reply(
             packet,
@@ -218,10 +358,30 @@ impl DhcpServer {
         Ok(())
     }
 
-    async fn handle_release(&self, packet: &DhcpPacket) -> Result<()> {
-        let mac = packet.mac_address();
+    fn is_static_binding(&self, client_id: &[u8], ip: Ipv4Addr) -> bool {
+        if client_id.len() == 7 && client_id[0] == 1 {
+            let mac = format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                client_id[1], client_id[2], client_id[3], client_id[4], client_id[5], client_id[6]
+            );
+            self.config.static_bindings.iter().any(|binding| {
+                binding.ip_address == ip && binding.mac_address.to_lowercase() == mac
+            })
+        } else {
+            false
+        }
+    }
 
-        self.lease_manager.release_lease(&mac).await?;
+    async fn handle_release(&self, packet: &DhcpPacket) -> Result<()> {
+        let mac = packet.format_mac();
+        let client_id = packet.client_id();
+
+        if packet.ciaddr == Ipv4Addr::UNSPECIFIED {
+            warn!("RELEASE from {} with no ciaddr", mac);
+            return Ok(());
+        }
+
+        self.leases.release_lease(&client_id, packet.ciaddr).await?;
 
         info!("RELEASE from {} for {}", mac, packet.ciaddr);
 
@@ -229,22 +389,35 @@ impl DhcpServer {
     }
 
     async fn handle_decline(&self, packet: &DhcpPacket) -> Result<()> {
-        let mac = packet.mac_address();
+        let mac = packet.format_mac();
+        let client_id = packet.client_id();
 
         if let Some(declined_ip) = packet.requested_ip() {
-            warn!(
-                "DECLINE from {} for {} - marking IP as unavailable",
-                mac, declined_ip
-            );
+            let accepted = self.leases.decline_ip(declined_ip, &client_id).await?;
+
+            if accepted {
+                warn!(
+                    "DECLINE from {} for {} - marked IP as unavailable",
+                    mac, declined_ip
+                );
+            } else {
+                warn!(
+                    "DECLINE from {} for {} rejected - IP not associated with this client",
+                    mac, declined_ip
+                );
+            }
         }
 
         Ok(())
     }
 
     async fn handle_inform(&self, packet: &DhcpPacket) -> Result<()> {
-        let mac = packet.mac_address();
+        let mac = packet.format_mac();
 
-        let options = self.build_inform_options();
+        let mut options = self.build_inform_options();
+        if let Some(relay_info) = packet.relay_agent_info() {
+            options.push(DhcpOption::RelayAgentInfo(relay_info.to_vec()));
+        }
 
         let ack = DhcpPacket::create_reply(
             packet,
@@ -262,9 +435,12 @@ impl DhcpServer {
     }
 
     async fn send_nak(&self, packet: &DhcpPacket, reason: &str) -> Result<()> {
-        let mac = packet.mac_address();
+        let mac = packet.format_mac();
 
-        let options = vec![DhcpOption::ServerIdentifier(self.config.server_ip)];
+        let mut options = vec![DhcpOption::ServerIdentifier(self.config.server_ip)];
+        if let Some(relay_info) = packet.relay_agent_info() {
+            options.push(DhcpOption::RelayAgentInfo(relay_info.to_vec()));
+        }
 
         let nak = DhcpPacket::create_reply(
             packet,
@@ -284,7 +460,11 @@ impl DhcpServer {
     async fn send_reply(&self, reply: &DhcpPacket, request: &DhcpPacket) -> Result<()> {
         let encoded = reply.encode();
 
-        let destination = if request.is_broadcast() || request.ciaddr == Ipv4Addr::UNSPECIFIED {
+        let is_nak = reply.message_type() == Some(MessageType::Nak);
+
+        let destination = if request.giaddr != Ipv4Addr::UNSPECIFIED {
+            SocketAddr::new(std::net::IpAddr::V4(request.giaddr), DHCP_SERVER_PORT)
+        } else if is_nak || request.is_broadcast() || request.ciaddr == Ipv4Addr::UNSPECIFIED {
             SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::BROADCAST), DHCP_CLIENT_PORT)
         } else {
             SocketAddr::new(std::net::IpAddr::V4(request.ciaddr), DHCP_CLIENT_PORT)
@@ -295,12 +475,8 @@ impl DhcpServer {
         Ok(())
     }
 
-    fn build_offer_options(&self, _offered_ip: Ipv4Addr) -> Vec<DhcpOption> {
-        let mut options = vec![
-            DhcpOption::ServerIdentifier(self.config.server_ip),
-            DhcpOption::LeaseTime(self.config.lease_duration_seconds),
-            DhcpOption::SubnetMask(self.config.subnet_mask),
-        ];
+    fn build_common_options(&self, options: &mut Vec<DhcpOption>) {
+        options.push(DhcpOption::SubnetMask(self.config.subnet_mask));
 
         if let Some(gateway) = self.config.gateway {
             options.push(DhcpOption::Router(vec![gateway]));
@@ -313,6 +489,15 @@ impl DhcpServer {
         if let Some(ref domain) = self.config.domain_name {
             options.push(DhcpOption::DomainName(domain.clone()));
         }
+    }
+
+    fn build_offer_options(&self) -> Vec<DhcpOption> {
+        let mut options = vec![
+            DhcpOption::ServerIdentifier(self.config.server_ip),
+            DhcpOption::LeaseTime(self.config.lease_duration_seconds),
+        ];
+
+        self.build_common_options(&mut options);
 
         options.push(DhcpOption::BroadcastAddress(
             self.config.calculate_broadcast(),
@@ -341,37 +526,12 @@ impl DhcpServer {
         options
     }
 
-    fn build_ack_options(&self, lease: &crate::lease::Lease) -> Vec<DhcpOption> {
-        self.build_offer_options(lease.ip_address)
-    }
-
     fn build_inform_options(&self) -> Vec<DhcpOption> {
-        let mut options = vec![
-            DhcpOption::ServerIdentifier(self.config.server_ip),
-            DhcpOption::SubnetMask(self.config.subnet_mask),
-        ];
+        let mut options = vec![DhcpOption::ServerIdentifier(self.config.server_ip)];
 
-        if let Some(gateway) = self.config.gateway {
-            options.push(DhcpOption::Router(vec![gateway]));
-        }
-
-        if !self.config.dns_servers.is_empty() {
-            options.push(DhcpOption::DnsServer(self.config.dns_servers.clone()));
-        }
-
-        if let Some(ref domain) = self.config.domain_name {
-            options.push(DhcpOption::DomainName(domain.clone()));
-        }
+        self.build_common_options(&mut options);
 
         options
-    }
-
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
-
-    pub fn lease_manager(&self) -> &LeaseManager {
-        &self.lease_manager
     }
 }
 
@@ -406,6 +566,15 @@ fn set_interface_index(raw_socket: std::os::windows::io::RawSocket, index: u32) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_constants() {
+        assert_eq!(DHCP_SERVER_PORT, 67);
+        assert_eq!(DHCP_CLIENT_PORT, 68);
+        assert_eq!(RECV_BUFFER_SIZE, 1500);
+        assert_eq!(RATE_LIMIT_MAX_REQUESTS, 10);
+        assert_eq!(RATE_LIMIT_WINDOW_SECS, 1);
+    }
+
     fn test_config() -> Config {
         Config {
             server_ip: Ipv4Addr::new(192, 168, 1, 1),
@@ -413,11 +582,11 @@ mod tests {
             pool_start: Ipv4Addr::new(192, 168, 1, 100),
             pool_end: Ipv4Addr::new(192, 168, 1, 200),
             gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
-            dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
+            dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8)],
             domain_name: Some("test.local".to_string()),
-            lease_duration_seconds: 86400,
-            renewal_time_seconds: None,
-            rebinding_time_seconds: None,
+            lease_duration_seconds: 3600,
+            renewal_time_seconds: Some(1800),
+            rebinding_time_seconds: Some(3150),
             broadcast_address: None,
             mtu: Some(1500),
             static_bindings: vec![],
@@ -427,8 +596,79 @@ mod tests {
     }
 
     #[test]
-    fn test_config_validation() {
+    fn test_offer_options_content() {
         let config = test_config();
-        assert!(config.validate().is_ok());
+
+        let mut options = vec![
+            DhcpOption::ServerIdentifier(config.server_ip),
+            DhcpOption::LeaseTime(config.lease_duration_seconds),
+            DhcpOption::SubnetMask(config.subnet_mask),
+        ];
+
+        if let Some(gateway) = config.gateway {
+            options.push(DhcpOption::Router(vec![gateway]));
+        }
+
+        if !config.dns_servers.is_empty() {
+            options.push(DhcpOption::DnsServer(config.dns_servers.clone()));
+        }
+
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::ServerIdentifier(_)))
+        );
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::LeaseTime(3600)))
+        );
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::SubnetMask(_)))
+        );
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::Router(_)))
+        );
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::DnsServer(_)))
+        );
+    }
+
+    #[test]
+    fn test_renewal_time_calculations() {
+        let config_default = Config {
+            lease_duration_seconds: 3600,
+            renewal_time_seconds: None,
+            rebinding_time_seconds: None,
+            ..test_config()
+        };
+
+        let expected_renewal = config_default.lease_duration_seconds / 2;
+        let expected_rebinding = (config_default.lease_duration_seconds * 7) / 8;
+
+        assert_eq!(expected_renewal, 1800);
+        assert_eq!(expected_rebinding, 3150);
+
+        let config_explicit = Config {
+            renewal_time_seconds: Some(1000),
+            rebinding_time_seconds: Some(2000),
+            ..test_config()
+        };
+
+        assert_eq!(config_explicit.renewal_time_seconds, Some(1000));
+        assert_eq!(config_explicit.rebinding_time_seconds, Some(2000));
+    }
+
+    #[test]
+    fn test_broadcast_calculation() {
+        let config = test_config();
+        let broadcast = config.calculate_broadcast();
+        assert_eq!(broadcast, Ipv4Addr::new(192, 168, 1, 255));
     }
 }

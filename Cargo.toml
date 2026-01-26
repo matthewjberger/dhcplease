@@ -2,15 +2,19 @@
 name = "dhcplease"
 version = "0.1.0"
 authors = ["Matthew Berger <matthewjordanberger@gmail.com>"]
-edition = "2024"
-rust-version = "1.85"
-license = "MIT OR Apache-2.0"
 description = "A developer-grade DHCP server for Windows"
-keywords = ["dhcp", "network", "server"]
+readme = "README.md"
+homepage = "https://github.com/matthewjberger/dhcplease"
+repository = "https://github.com/matthewjberger/dhcplease"
+keywords = ["dhcp", "network", "server", "windows"]
 categories = ["network-programming"]
+license = "MIT OR Apache-2.0"
+edition = "2024"
+rust-version = "1.90"
 
 [lib]
 path = "src/lib.rs"
+doctest = false
 
 [[bin]]
 name = "dhcplease"
