@@ -288,12 +288,22 @@ impl DhcpPacket {
         None
     }
 
+    pub fn parameter_request_list(&self) -> Option<&[u8]> {
+        for option in &self.options {
+            if let DhcpOption::ParameterRequestList(params) = option {
+                return Some(params);
+            }
+        }
+        None
+    }
+
     pub fn chaddr_bytes(&self) -> &[u8] {
         &self.chaddr[..self.hlen as usize]
     }
 
     pub fn format_mac(&self) -> String {
-        self.chaddr[..6]
+        let len = (self.hlen as usize).min(self.chaddr.len());
+        self.chaddr[..len]
             .iter()
             .map(|byte| format!("{:02x}", byte))
             .collect::<Vec<_>>()
@@ -340,6 +350,31 @@ impl DhcpPacket {
             sname: [0u8; 64],
             file: [0u8; 128],
             options: all_options,
+        }
+    }
+
+    pub fn create_bootp_reply(
+        request: &DhcpPacket,
+        your_ip: Ipv4Addr,
+        server_ip: Ipv4Addr,
+        options: Vec<DhcpOption>,
+    ) -> Self {
+        Self {
+            op: BOOTREPLY,
+            htype: request.htype,
+            hlen: request.hlen,
+            hops: 0,
+            xid: request.xid,
+            secs: 0,
+            flags: request.flags,
+            ciaddr: Ipv4Addr::UNSPECIFIED,
+            yiaddr: your_ip,
+            siaddr: server_ip,
+            giaddr: request.giaddr,
+            chaddr: request.chaddr,
+            sname: [0u8; 64],
+            file: [0u8; 128],
+            options,
         }
     }
 }
@@ -501,6 +536,231 @@ mod tests {
         assert_eq!(
             parsed.client_id(),
             vec![1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        );
+    }
+
+    #[test]
+    fn test_option_overload_file() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+
+        let mut index = 243;
+        packet[index] = OptionCode::OptionOverload as u8;
+        packet[index + 1] = 1;
+        packet[index + 2] = 1;
+        index += 3;
+        packet[index] = OptionCode::End as u8;
+
+        packet[108] = OptionCode::Hostname as u8;
+        packet[109] = 8;
+        packet[110..118].copy_from_slice(b"filehost");
+        packet[118] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.hostname(), Some("filehost"));
+    }
+
+    #[test]
+    fn test_option_overload_sname() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+
+        let mut index = 243;
+        packet[index] = OptionCode::OptionOverload as u8;
+        packet[index + 1] = 1;
+        packet[index + 2] = 2;
+        index += 3;
+        packet[index] = OptionCode::End as u8;
+
+        packet[44] = OptionCode::Hostname as u8;
+        packet[45] = 9;
+        packet[46..55].copy_from_slice(b"snamehost");
+        packet[55] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.hostname(), Some("snamehost"));
+    }
+
+    #[test]
+    fn test_option_overload_both() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+
+        let mut index = 243;
+        packet[index] = OptionCode::OptionOverload as u8;
+        packet[index + 1] = 1;
+        packet[index + 2] = 3;
+        index += 3;
+        packet[index] = OptionCode::End as u8;
+
+        packet[44] = OptionCode::Hostname as u8;
+        packet[45] = 5;
+        packet[46..51].copy_from_slice(b"sname");
+        packet[51] = OptionCode::End as u8;
+
+        packet[108] = OptionCode::DomainName as u8;
+        packet[109] = 10;
+        packet[110..120].copy_from_slice(b"file.local");
+        packet[120] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.hostname(), Some("sname"));
+
+        let has_domain = parsed
+            .options
+            .iter()
+            .any(|opt| matches!(opt, DhcpOption::DomainName(name) if name == "file.local"));
+        assert!(has_domain);
+    }
+
+    #[test]
+    fn test_chaddr_bytes_respects_hlen() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+        packet[1] = 6;
+        packet[2] = 4;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.chaddr_bytes().len(), 4);
+        assert_eq!(parsed.chaddr_bytes(), &[0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn test_relay_agent_info_parsing() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+
+        let mut index = 243;
+        packet[index] = OptionCode::RelayAgentInfo as u8;
+        packet[index + 1] = 5;
+        packet[index + 2..index + 7].copy_from_slice(&[1, 2, 3, 4, 5]);
+        index += 7;
+        packet[index] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.relay_agent_info(), Some(&[1u8, 2, 3, 4, 5][..]));
+    }
+
+    #[test]
+    fn test_server_identifier_parsing() {
+        let mut packet = create_test_packet(MessageType::Request, false);
+
+        let mut index = 243;
+        packet[index] = OptionCode::ServerIdentifier as u8;
+        packet[index + 1] = 4;
+        packet[index + 2..index + 6].copy_from_slice(&[192, 168, 1, 1]);
+        index += 6;
+        packet[index] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(
+            parsed.server_identifier(),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+    }
+
+    #[test]
+    fn test_unicast_flag() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+        packet[10..12].copy_from_slice(&0x0000u16.to_be_bytes());
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert!(!parsed.is_broadcast());
+    }
+
+    #[test]
+    fn test_giaddr_preserved_in_reply() {
+        let mut packet_data = create_test_packet(MessageType::Discover, false);
+        let giaddr = Ipv4Addr::new(192, 168, 2, 1);
+        packet_data[24..28].copy_from_slice(&giaddr.octets());
+
+        let request = DhcpPacket::parse(&packet_data).unwrap();
+        let reply = DhcpPacket::create_reply(
+            &request,
+            MessageType::Offer,
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 1),
+            vec![],
+        );
+
+        assert_eq!(reply.giaddr, giaddr);
+    }
+
+    #[test]
+    fn test_min_packet_size_on_encode() {
+        let packet = DhcpPacket {
+            op: BOOTREPLY,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            hops: 0,
+            xid: 0x12345678,
+            secs: 0,
+            flags: 0,
+            ciaddr: Ipv4Addr::UNSPECIFIED,
+            yiaddr: Ipv4Addr::new(192, 168, 1, 100),
+            siaddr: Ipv4Addr::new(192, 168, 1, 1),
+            giaddr: Ipv4Addr::UNSPECIFIED,
+            chaddr: [0; 16],
+            sname: [0; 64],
+            file: [0; 128],
+            options: vec![DhcpOption::MessageType(MessageType::Offer)],
+        };
+
+        let encoded = packet.encode();
+        assert!(encoded.len() >= DHCP_MIN_PACKET_SIZE);
+    }
+
+    #[test]
+    fn test_flags_preserved_in_reply() {
+        let mut packet_data = create_test_packet(MessageType::Discover, false);
+        packet_data[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
+
+        let request = DhcpPacket::parse(&packet_data).unwrap();
+        let reply = DhcpPacket::create_reply(
+            &request,
+            MessageType::Offer,
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 1),
+            vec![],
+        );
+
+        assert_eq!(reply.flags, 0x8000);
+        assert!(reply.is_broadcast());
+    }
+
+    #[test]
+    fn test_create_bootp_reply() {
+        let request_data = create_test_packet(MessageType::Discover, false);
+        let request = DhcpPacket::parse(&request_data).unwrap();
+
+        let options = vec![
+            DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)),
+            DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 1)]),
+        ];
+
+        let reply = DhcpPacket::create_bootp_reply(
+            &request,
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 1),
+            options,
+        );
+
+        assert_eq!(reply.op, BOOTREPLY);
+        assert_eq!(reply.xid, request.xid);
+        assert_eq!(reply.yiaddr, Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(reply.siaddr, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(reply.chaddr, request.chaddr);
+        assert_eq!(reply.htype, request.htype);
+        assert_eq!(reply.hlen, request.hlen);
+
+        assert!(reply.message_type().is_none());
+
+        assert!(
+            reply
+                .options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::SubnetMask(_)))
+        );
+        assert!(
+            reply
+                .options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::Router(_)))
         );
     }
 }

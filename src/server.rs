@@ -197,23 +197,68 @@ impl PacketHandler {
             return Ok(());
         }
 
-        let message_type = packet
-            .message_type()
-            .ok_or_else(|| Error::InvalidPacket("Missing message type option".to_string()))?;
+        match packet.message_type() {
+            Some(message_type) => {
+                info!("{} from {} ({})", message_type, mac, source);
 
-        info!("{} from {} ({})", message_type, mac, source);
-
-        match message_type {
-            MessageType::Discover => self.handle_discover(&packet).await,
-            MessageType::Request => self.handle_request(&packet).await,
-            MessageType::Release => self.handle_release(&packet).await,
-            MessageType::Decline => self.handle_decline(&packet).await,
-            MessageType::Inform => self.handle_inform(&packet).await,
-            _ => {
-                warn!("Ignoring {} message", message_type);
-                Ok(())
+                match message_type {
+                    MessageType::Discover => self.handle_discover(&packet).await,
+                    MessageType::Request => self.handle_request(&packet).await,
+                    MessageType::Release => self.handle_release(&packet).await,
+                    MessageType::Decline => self.handle_decline(&packet).await,
+                    MessageType::Inform => self.handle_inform(&packet).await,
+                    _ => {
+                        warn!("Ignoring {} message", message_type);
+                        Ok(())
+                    }
+                }
+            }
+            None => {
+                info!("BOOTP from {} ({})", mac, source);
+                self.handle_bootp(&packet).await
             }
         }
+    }
+
+    async fn handle_bootp(&self, packet: &DhcpPacket) -> Result<()> {
+        let mac = packet.format_mac();
+        let client_id = packet.client_id();
+
+        let assigned_ip = if packet.ciaddr != Ipv4Addr::UNSPECIFIED {
+            packet.ciaddr
+        } else {
+            match self.leases.allocate_ip(&client_id).await {
+                Ok(ip) => ip,
+                Err(Error::PoolExhausted) => {
+                    warn!("Pool exhausted, cannot assign IP to BOOTP client {}", mac);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        let hostname = packet.hostname().map(crate::config::sanitize_hostname);
+        self.leases
+            .create_lease(&client_id, assigned_ip, hostname)
+            .await?;
+
+        let mut options = Vec::new();
+        options.push(DhcpOption::SubnetMask(self.config.subnet_mask));
+        if let Some(gateway) = self.config.gateway {
+            options.push(DhcpOption::Router(vec![gateway]));
+        }
+        if !self.config.dns_servers.is_empty() {
+            options.push(DhcpOption::DnsServer(self.config.dns_servers.clone()));
+        }
+
+        let reply =
+            DhcpPacket::create_bootp_reply(packet, assigned_ip, self.config.server_ip, options);
+
+        self.send_reply(&reply, packet).await?;
+
+        info!("BOOTP reply {} to {}", assigned_ip, mac);
+
+        Ok(())
     }
 
     async fn handle_discover(&self, packet: &DhcpPacket) -> Result<()> {
@@ -225,6 +270,9 @@ impl PacketHandler {
                 if self.config.ip_in_pool(requested_ip)
                     && self.leases.is_ip_available(requested_ip, &client_id).await =>
             {
+                self.leases
+                    .track_pending_offer(&client_id, requested_ip)
+                    .await;
                 requested_ip
             }
             _ => match self.leases.allocate_ip(&client_id).await {
@@ -237,7 +285,8 @@ impl PacketHandler {
             },
         };
 
-        let mut options = self.build_offer_options();
+        let options = self.build_offer_options();
+        let mut options = self.filter_options_by_prl(options, packet.parameter_request_list());
         if let Some(relay_info) = packet.relay_agent_info() {
             options.push(DhcpOption::RelayAgentInfo(relay_info.to_vec()));
         }
@@ -333,7 +382,8 @@ impl PacketHandler {
             }
         };
 
-        let mut options = self.build_offer_options();
+        let options = self.build_offer_options();
+        let mut options = self.filter_options_by_prl(options, packet.parameter_request_list());
         if let Some(relay_info) = packet.relay_agent_info() {
             options.push(DhcpOption::RelayAgentInfo(relay_info.to_vec()));
         }
@@ -359,17 +409,7 @@ impl PacketHandler {
     }
 
     fn is_static_binding(&self, client_id: &[u8], ip: Ipv4Addr) -> bool {
-        if client_id.len() == 7 && client_id[0] == 1 {
-            let mac = format!(
-                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                client_id[1], client_id[2], client_id[3], client_id[4], client_id[5], client_id[6]
-            );
-            self.config.static_bindings.iter().any(|binding| {
-                binding.ip_address == ip && binding.mac_address.to_lowercase() == mac
-            })
-        } else {
-            false
-        }
+        self.leases.is_static_binding(client_id, ip)
     }
 
     async fn handle_release(&self, packet: &DhcpPacket) -> Result<()> {
@@ -414,7 +454,8 @@ impl PacketHandler {
     async fn handle_inform(&self, packet: &DhcpPacket) -> Result<()> {
         let mac = packet.format_mac();
 
-        let mut options = self.build_inform_options();
+        let options = self.build_inform_options();
+        let mut options = self.filter_options_by_prl(options, packet.parameter_request_list());
         if let Some(relay_info) = packet.relay_agent_info() {
             options.push(DhcpOption::RelayAgentInfo(relay_info.to_vec()));
         }
@@ -533,6 +574,24 @@ impl PacketHandler {
 
         options
     }
+
+    fn filter_options_by_prl(
+        &self,
+        options: Vec<DhcpOption>,
+        parameter_request_list: Option<&[u8]>,
+    ) -> Vec<DhcpOption> {
+        let Some(prl) = parameter_request_list else {
+            return options;
+        };
+
+        options
+            .into_iter()
+            .filter(|opt| {
+                let code = opt.option_code();
+                matches!(code, 53 | 54 | 51 | 58 | 59) || prl.contains(&code)
+            })
+            .collect()
+    }
 }
 
 #[cfg(windows)]
@@ -565,6 +624,12 @@ fn set_interface_index(raw_socket: std::os::windows::io::RawSocket, index: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StaticBinding;
+    use crate::options::OptionCode;
+    use crate::packet::{BOOTREQUEST, DhcpPacket, HLEN_ETHERNET, HTYPE_ETHERNET};
+    use std::net::SocketAddr;
+
+    const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 
     #[test]
     fn test_constants() {
@@ -595,49 +660,113 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_offer_options_content() {
-        let config = test_config();
+    fn test_config_with_path(name: &str) -> (Config, TestGuard) {
+        let path = format!("test_server_{}.json", name);
+        (
+            Config {
+                leases_file: path.clone(),
+                ..test_config()
+            },
+            TestGuard(path),
+        )
+    }
 
-        let mut options = vec![
-            DhcpOption::ServerIdentifier(config.server_ip),
-            DhcpOption::LeaseTime(config.lease_duration_seconds),
-            DhcpOption::SubnetMask(config.subnet_mask),
-        ];
+    struct TestGuard(String);
+    impl Drop for TestGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
-        if let Some(gateway) = config.gateway {
-            options.push(DhcpOption::Router(vec![gateway]));
+    fn create_dhcp_packet(
+        message_type: MessageType,
+        mac: [u8; 6],
+        xid: u32,
+        options: Vec<DhcpOption>,
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; 300];
+
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[3] = 0;
+        packet[4..8].copy_from_slice(&xid.to_be_bytes());
+        packet[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
+        packet[28..34].copy_from_slice(&mac);
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+
+        let mut index = 240;
+        packet[index] = OptionCode::MessageType as u8;
+        packet[index + 1] = 1;
+        packet[index + 2] = message_type as u8;
+        index += 3;
+
+        for option in options {
+            let encoded = option.encode();
+            packet[index..index + encoded.len()].copy_from_slice(&encoded);
+            index += encoded.len();
         }
 
-        if !config.dns_servers.is_empty() {
-            options.push(DhcpOption::DnsServer(config.dns_servers.clone()));
-        }
+        packet[index] = OptionCode::End as u8;
+        packet
+    }
 
-        assert!(
-            options
-                .iter()
-                .any(|opt| matches!(opt, DhcpOption::ServerIdentifier(_)))
-        );
-        assert!(
-            options
-                .iter()
-                .any(|opt| matches!(opt, DhcpOption::LeaseTime(3600)))
-        );
-        assert!(
-            options
-                .iter()
-                .any(|opt| matches!(opt, DhcpOption::SubnetMask(_)))
-        );
-        assert!(
-            options
-                .iter()
-                .any(|opt| matches!(opt, DhcpOption::Router(_)))
-        );
-        assert!(
-            options
-                .iter()
-                .any(|opt| matches!(opt, DhcpOption::DnsServer(_)))
-        );
+    fn create_packet_with_ciaddr(
+        message_type: MessageType,
+        mac: [u8; 6],
+        xid: u32,
+        ciaddr: Ipv4Addr,
+        options: Vec<DhcpOption>,
+    ) -> Vec<u8> {
+        let mut packet = create_dhcp_packet(message_type, mac, xid, options);
+        packet[12..16].copy_from_slice(&ciaddr.octets());
+        packet
+    }
+
+    fn create_packet_with_giaddr(
+        message_type: MessageType,
+        mac: [u8; 6],
+        xid: u32,
+        giaddr: Ipv4Addr,
+        options: Vec<DhcpOption>,
+    ) -> Vec<u8> {
+        let mut packet = create_dhcp_packet(message_type, mac, xid, options);
+        packet[24..28].copy_from_slice(&giaddr.octets());
+        packet
+    }
+
+    fn create_unicast_packet(
+        message_type: MessageType,
+        mac: [u8; 6],
+        xid: u32,
+        ciaddr: Ipv4Addr,
+        options: Vec<DhcpOption>,
+    ) -> Vec<u8> {
+        let mut packet = create_packet_with_ciaddr(message_type, mac, xid, ciaddr, options);
+        packet[10..12].copy_from_slice(&0x0000u16.to_be_bytes());
+        packet
+    }
+
+    async fn create_test_handler(name: &str) -> (PacketHandler, TestGuard, Arc<UdpSocket>) {
+        let (config, guard) = test_config_with_path(name);
+        let config = Arc::new(config);
+        let leases = Arc::new(Leases::new(Arc::clone(&config)).await.unwrap());
+
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = Arc::new(socket);
+
+        let handler = PacketHandler {
+            config,
+            leases,
+            socket: Arc::clone(&socket),
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        (handler, guard, socket)
+    }
+
+    fn is_network_error(err: &Error) -> bool {
+        matches!(err, Error::Io(_))
     }
 
     #[test]
@@ -665,10 +794,649 @@ mod tests {
         assert_eq!(config_explicit.rebinding_time_seconds, Some(2000));
     }
 
-    #[test]
-    fn test_broadcast_calculation() {
-        let config = test_config();
-        let broadcast = config.calculate_broadcast();
-        assert_eq!(broadcast, Ipv4Addr::new(192, 168, 1, 255));
+    #[tokio::test]
+    async fn test_rate_limiting() {
+        let (handler, _guard, _socket) = create_test_handler("rate_limit").await;
+
+        let mac = "aa:bb:cc:dd:ee:ff";
+
+        for _ in 0..RATE_LIMIT_MAX_REQUESTS {
+            assert!(!handler.is_rate_limited(mac).await);
+        }
+
+        assert!(handler.is_rate_limited(mac).await);
+
+        let other_mac = "11:22:33:44:55:66";
+        assert!(!handler.is_rate_limited(other_mac).await);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_cleanup() {
+        let (handler, _guard, _socket) = create_test_handler("rate_cleanup").await;
+
+        let total_macs = RATE_LIMIT_CLEANUP_THRESHOLD + 10;
+        for index in 0..total_macs {
+            let mac = format!("aa:bb:cc:dd:{:02x}:{:02x}", index / 256, index % 256);
+            handler.is_rate_limited(&mac).await;
+        }
+
+        let limiter = handler.rate_limiter.lock().await;
+        assert_eq!(limiter.len(), total_macs);
+    }
+
+    #[tokio::test]
+    async fn test_handle_discover_allocates_ip() {
+        let (handler, _guard, _socket) = create_test_handler("discover").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01];
+        let packet_data = create_dhcp_packet(MessageType::Discover, mac, 0x12345678, vec![]);
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_discover(&packet).await;
+        assert!(result.is_ok() || result.as_ref().err().map(is_network_error).unwrap_or(false));
+
+        let client_id = packet.client_id();
+        let allocated = handler.leases.allocate_ip(&client_id).await.unwrap();
+        assert!(handler.config.ip_in_pool(allocated));
+    }
+
+    #[tokio::test]
+    async fn test_handle_discover_with_requested_ip() {
+        let (handler, _guard, _socket) = create_test_handler("discover_req").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02];
+        let requested_ip = Ipv4Addr::new(192, 168, 1, 150);
+        let packet_data = create_dhcp_packet(
+            MessageType::Discover,
+            mac,
+            0x12345678,
+            vec![DhcpOption::RequestedIpAddress(requested_ip)],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_discover(&packet).await;
+        assert!(result.is_ok() || result.as_ref().err().map(is_network_error).unwrap_or(false));
+
+        let client_id = packet.client_id();
+        let allocated = handler.leases.allocate_ip(&client_id).await.unwrap();
+        assert_eq!(allocated, requested_ip);
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_creates_lease() {
+        let (handler, _guard, _socket) = create_test_handler("request").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x03];
+        let client_id = {
+            let mut id = vec![HTYPE_ETHERNET];
+            id.extend_from_slice(&mac);
+            id
+        };
+
+        let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+
+        let packet_data = create_dhcp_packet(
+            MessageType::Request,
+            mac,
+            0x12345678,
+            vec![
+                DhcpOption::RequestedIpAddress(ip),
+                DhcpOption::ServerIdentifier(handler.config.server_ip),
+            ],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_request(&packet).await;
+        assert!(result.is_ok() || result.as_ref().err().map(is_network_error).unwrap_or(false));
+
+        let lease = handler.leases.get_lease(&client_id).await;
+        assert!(lease.is_some());
+        assert_eq!(lease.unwrap().ip_address, ip);
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_with_ciaddr() {
+        let (handler, _guard, _socket) = create_test_handler("request_ciaddr").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x04];
+        let client_id = {
+            let mut id = vec![HTYPE_ETHERNET];
+            id.extend_from_slice(&mac);
+            id
+        };
+
+        let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+        handler
+            .leases
+            .create_lease(&client_id, ip, None)
+            .await
+            .unwrap();
+
+        let packet_data = create_unicast_packet(MessageType::Request, mac, 0x12345678, ip, vec![]);
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_request(&packet).await;
+        assert!(result.is_ok() || result.as_ref().err().map(is_network_error).unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_different_server() {
+        let (handler, _guard, _socket) = create_test_handler("request_other").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x05];
+        let other_server = Ipv4Addr::new(192, 168, 1, 2);
+
+        let packet_data = create_dhcp_packet(
+            MessageType::Request,
+            mac,
+            0x12345678,
+            vec![
+                DhcpOption::RequestedIpAddress(Ipv4Addr::new(192, 168, 1, 100)),
+                DhcpOption::ServerIdentifier(other_server),
+            ],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_request(&packet).await;
+        assert!(result.is_ok());
+
+        let client_id = packet.client_id();
+        let lease = handler.leases.get_lease(&client_id).await;
+        assert!(lease.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_ip_not_in_pool() {
+        let (handler, _guard, _socket) = create_test_handler("request_bad_ip").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x06];
+        let bad_ip = Ipv4Addr::new(10, 0, 0, 1);
+
+        let packet_data = create_dhcp_packet(
+            MessageType::Request,
+            mac,
+            0x12345678,
+            vec![
+                DhcpOption::RequestedIpAddress(bad_ip),
+                DhcpOption::ServerIdentifier(handler.config.server_ip),
+            ],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_request(&packet).await;
+        assert!(result.is_ok() || result.as_ref().err().map(is_network_error).unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_handle_release() {
+        let (handler, _guard, _socket) = create_test_handler("release").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x07];
+        let client_id = {
+            let mut id = vec![HTYPE_ETHERNET];
+            id.extend_from_slice(&mac);
+            id
+        };
+
+        let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+        handler
+            .leases
+            .create_lease(&client_id, ip, None)
+            .await
+            .unwrap();
+
+        let packet_data = create_packet_with_ciaddr(
+            MessageType::Release,
+            mac,
+            0x12345678,
+            ip,
+            vec![DhcpOption::ServerIdentifier(handler.config.server_ip)],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_release(&packet).await;
+        assert!(result.is_ok());
+
+        let lease = handler.leases.get_lease(&client_id).await;
+        assert!(lease.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_release_no_ciaddr() {
+        let (handler, _guard, _socket) = create_test_handler("release_no_ci").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x08];
+        let packet_data = create_dhcp_packet(MessageType::Release, mac, 0x12345678, vec![]);
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_release(&packet).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_decline() {
+        let (handler, _guard, _socket) = create_test_handler("decline").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x09];
+        let client_id = {
+            let mut id = vec![HTYPE_ETHERNET];
+            id.extend_from_slice(&mac);
+            id
+        };
+
+        let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+        handler
+            .leases
+            .create_lease(&client_id, ip, None)
+            .await
+            .unwrap();
+
+        let packet_data = create_dhcp_packet(
+            MessageType::Decline,
+            mac,
+            0x12345678,
+            vec![DhcpOption::RequestedIpAddress(ip)],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_decline(&packet).await;
+        assert!(result.is_ok());
+
+        assert!(!handler.leases.is_ip_available(ip, &client_id).await);
+    }
+
+    #[tokio::test]
+    async fn test_handle_inform() {
+        let (handler, _guard, _socket) = create_test_handler("inform").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0a];
+        let ciaddr = Ipv4Addr::new(192, 168, 1, 50);
+
+        let packet_data =
+            create_packet_with_ciaddr(MessageType::Inform, mac, 0x12345678, ciaddr, vec![]);
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_inform(&packet).await;
+        assert!(result.is_ok() || result.as_ref().err().map(is_network_error).unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_relay_agent_info_echoed_in_options() {
+        let (handler, _guard, _socket) = create_test_handler("relay_echo").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0b];
+        let relay_info = vec![1, 2, 3, 4, 5];
+
+        let packet_data = create_dhcp_packet(
+            MessageType::Discover,
+            mac,
+            0x12345678,
+            vec![DhcpOption::RelayAgentInfo(relay_info.clone())],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        assert_eq!(packet.relay_agent_info(), Some(relay_info.as_slice()));
+
+        let mut options = handler.build_offer_options();
+        if let Some(info) = packet.relay_agent_info() {
+            options.push(DhcpOption::RelayAgentInfo(info.to_vec()));
+        }
+
+        let has_relay_info = options
+            .iter()
+            .any(|opt| matches!(opt, DhcpOption::RelayAgentInfo(data) if *data == relay_info));
+        assert!(has_relay_info);
+    }
+
+    #[tokio::test]
+    async fn test_reply_destination_broadcast() {
+        let (handler, _guard, _socket) = create_test_handler("reply_bcast").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0c];
+        let request_data = create_dhcp_packet(MessageType::Discover, mac, 0x12345678, vec![]);
+        let request = DhcpPacket::parse(&request_data).unwrap();
+
+        assert!(request.is_broadcast());
+        assert_eq!(request.giaddr, Ipv4Addr::UNSPECIFIED);
+
+        let reply = DhcpPacket::create_reply(
+            &request,
+            MessageType::Offer,
+            Ipv4Addr::new(192, 168, 1, 100),
+            handler.config.server_ip,
+            vec![],
+        );
+
+        assert!(reply.is_broadcast());
+        assert_eq!(reply.giaddr, Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[tokio::test]
+    async fn test_reply_destination_relay() {
+        let (handler, _guard, _socket) = create_test_handler("reply_relay").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0d];
+        let giaddr = Ipv4Addr::new(192, 168, 2, 1);
+        let request_data =
+            create_packet_with_giaddr(MessageType::Discover, mac, 0x12345678, giaddr, vec![]);
+        let request = DhcpPacket::parse(&request_data).unwrap();
+
+        assert_eq!(request.giaddr, giaddr);
+
+        let reply = DhcpPacket::create_reply(
+            &request,
+            MessageType::Offer,
+            Ipv4Addr::new(192, 168, 1, 100),
+            handler.config.server_ip,
+            vec![],
+        );
+
+        assert_eq!(reply.giaddr, giaddr);
+    }
+
+    #[tokio::test]
+    async fn test_full_dora_flow() {
+        let (handler, _guard, _socket) = create_test_handler("dora").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0e];
+        let xid = 0xDEADBEEF;
+
+        let discover_data = create_dhcp_packet(MessageType::Discover, mac, xid, vec![]);
+        let discover = DhcpPacket::parse(&discover_data).unwrap();
+        let _ = handler.handle_discover(&discover).await;
+
+        let client_id = discover.client_id();
+
+        let offered_ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+
+        let request_data = create_dhcp_packet(
+            MessageType::Request,
+            mac,
+            xid,
+            vec![
+                DhcpOption::RequestedIpAddress(offered_ip),
+                DhcpOption::ServerIdentifier(handler.config.server_ip),
+            ],
+        );
+        let request = DhcpPacket::parse(&request_data).unwrap();
+        let _ = handler.handle_request(&request).await;
+
+        let lease = handler.leases.get_lease(&client_id).await.unwrap();
+        assert_eq!(lease.ip_address, offered_ip);
+        assert!(lease.remaining_seconds() > 3500);
+    }
+
+    #[tokio::test]
+    async fn test_renewal_flow() {
+        let (handler, _guard, _socket) = create_test_handler("renewal").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f];
+        let client_id = {
+            let mut id = vec![HTYPE_ETHERNET];
+            id.extend_from_slice(&mac);
+            id
+        };
+
+        let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+        handler
+            .leases
+            .create_lease(&client_id, ip, None)
+            .await
+            .unwrap();
+
+        let request_data = create_unicast_packet(MessageType::Request, mac, 0x12345678, ip, vec![]);
+        let request = DhcpPacket::parse(&request_data).unwrap();
+
+        let _ = handler.handle_request(&request).await;
+
+        let lease = handler.leases.get_lease(&client_id).await.unwrap();
+        assert_eq!(lease.ip_address, ip);
+    }
+
+    #[tokio::test]
+    async fn test_static_binding_check() {
+        let path = "test_server_static_bind.json".to_string();
+        let _guard = TestGuard(path.clone());
+
+        let config = Config {
+            static_bindings: vec![StaticBinding {
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                ip_address: Ipv4Addr::new(192, 168, 1, 50),
+                hostname: None,
+            }],
+            leases_file: path,
+            ..test_config()
+        };
+
+        let config = Arc::new(config);
+        let leases = Arc::new(Leases::new(Arc::clone(&config)).await.unwrap());
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let handler = PacketHandler {
+            config,
+            leases,
+            socket,
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let client_id = vec![1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let static_ip = Ipv4Addr::new(192, 168, 1, 50);
+
+        assert!(handler.is_static_binding(&client_id, static_ip));
+        assert!(!handler.is_static_binding(&client_id, Ipv4Addr::new(192, 168, 1, 51)));
+
+        let other_client = vec![1, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        assert!(!handler.is_static_binding(&other_client, static_ip));
+    }
+
+    #[tokio::test]
+    async fn test_handle_packet_rejects_bootreply() {
+        let (handler, _guard, _socket) = create_test_handler("bootreply").await;
+
+        let mut packet_data = create_dhcp_packet(
+            MessageType::Discover,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x10],
+            0x12345678,
+            vec![],
+        );
+        packet_data[0] = 2;
+
+        let source: SocketAddr = "127.0.0.1:68".parse().unwrap();
+        let result = handler.handle_packet(&packet_data, source).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_bootp_packet() {
+        let (handler, _guard, _socket) = create_test_handler("bootp").await;
+
+        let mut packet_data = vec![0u8; 300];
+        packet_data[0] = BOOTREQUEST;
+        packet_data[1] = HTYPE_ETHERNET;
+        packet_data[2] = HLEN_ETHERNET;
+        packet_data[28..34].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x11]);
+        packet_data[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet_data[240] = OptionCode::End as u8;
+
+        let source: SocketAddr = "127.0.0.1:68".parse().unwrap();
+        let result = handler.handle_packet(&packet_data, source).await;
+        assert!(result.is_ok() || result.as_ref().err().map(is_network_error).unwrap_or(false));
+
+        let client_id = vec![HTYPE_ETHERNET, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x11];
+        let lease = handler.leases.get_lease(&client_id).await;
+        assert!(lease.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_build_offer_options() {
+        let (handler, _guard, _socket) = create_test_handler("offer_opts").await;
+
+        let options = handler.build_offer_options();
+
+        assert!(options.iter().any(|opt| matches!(
+            opt,
+            DhcpOption::ServerIdentifier(ip) if *ip == handler.config.server_ip
+        )));
+        assert!(options.iter().any(|opt| matches!(
+            opt,
+            DhcpOption::LeaseTime(t) if *t == handler.config.lease_duration_seconds
+        )));
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::SubnetMask(_)))
+        );
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::Router(_)))
+        );
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::DnsServer(_)))
+        );
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::RenewalTime(_)))
+        );
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::RebindingTime(_)))
+        );
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::InterfaceMtu(1500)))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_inform_options() {
+        let (handler, _guard, _socket) = create_test_handler("inform_opts").await;
+
+        let options = handler.build_inform_options();
+
+        assert!(options.iter().any(|opt| matches!(
+            opt,
+            DhcpOption::ServerIdentifier(ip) if *ip == handler.config.server_ip
+        )));
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::SubnetMask(_)))
+        );
+        assert!(
+            !options
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::LeaseTime(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filter_options_by_prl() {
+        let (handler, _guard, _socket) = create_test_handler("prl_filter").await;
+
+        let options = handler.build_offer_options();
+
+        let prl_subnet_only: &[u8] = &[1];
+        let filtered = handler.filter_options_by_prl(options.clone(), Some(prl_subnet_only));
+
+        assert!(
+            filtered
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::SubnetMask(_)))
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::ServerIdentifier(_)))
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::LeaseTime(_)))
+        );
+        assert!(
+            !filtered
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::Router(_)))
+        );
+        assert!(
+            !filtered
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::DnsServer(_)))
+        );
+
+        let prl_router_dns: &[u8] = &[3, 6];
+        let filtered2 = handler.filter_options_by_prl(options.clone(), Some(prl_router_dns));
+
+        assert!(
+            filtered2
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::Router(_)))
+        );
+        assert!(
+            filtered2
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::DnsServer(_)))
+        );
+        assert!(
+            !filtered2
+                .iter()
+                .any(|opt| matches!(opt, DhcpOption::SubnetMask(_)))
+        );
+
+        let no_filter = handler.filter_options_by_prl(options.clone(), None);
+        assert_eq!(no_filter.len(), options.len());
+    }
+
+    #[tokio::test]
+    async fn test_pool_exhaustion() {
+        let path = "test_server_exhaustion.json".to_string();
+        let _guard = TestGuard(path.clone());
+
+        let config = Config {
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 102),
+            leases_file: path,
+            ..test_config()
+        };
+
+        let config = Arc::new(config);
+        let leases = Arc::new(Leases::new(Arc::clone(&config)).await.unwrap());
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let handler = PacketHandler {
+            config,
+            leases,
+            socket,
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        for index in 0..3u8 {
+            let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, index];
+            let client_id = {
+                let mut id = vec![HTYPE_ETHERNET];
+                id.extend_from_slice(&mac);
+                id
+            };
+
+            let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+            handler
+                .leases
+                .create_lease(&client_id, ip, None)
+                .await
+                .unwrap();
+        }
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x99];
+        let packet_data = create_dhcp_packet(MessageType::Discover, mac, 0x12345678, vec![]);
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let result = handler.handle_discover(&packet).await;
+        assert!(result.is_ok());
     }
 }

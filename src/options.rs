@@ -147,6 +147,29 @@ pub enum DhcpOption {
 }
 
 impl DhcpOption {
+    pub fn option_code(&self) -> u8 {
+        match self {
+            Self::SubnetMask(_) => OptionCode::SubnetMask as u8,
+            Self::Router(_) => OptionCode::Router as u8,
+            Self::DnsServer(_) => OptionCode::DnsServer as u8,
+            Self::Hostname(_) => OptionCode::Hostname as u8,
+            Self::DomainName(_) => OptionCode::DomainName as u8,
+            Self::BroadcastAddress(_) => OptionCode::BroadcastAddress as u8,
+            Self::RequestedIpAddress(_) => OptionCode::RequestedIpAddress as u8,
+            Self::LeaseTime(_) => OptionCode::LeaseTime as u8,
+            Self::OptionOverload(_) => OptionCode::OptionOverload as u8,
+            Self::MessageType(_) => OptionCode::MessageType as u8,
+            Self::ServerIdentifier(_) => OptionCode::ServerIdentifier as u8,
+            Self::ParameterRequestList(_) => OptionCode::ParameterRequestList as u8,
+            Self::RenewalTime(_) => OptionCode::RenewalTime as u8,
+            Self::RebindingTime(_) => OptionCode::RebindingTime as u8,
+            Self::ClientIdentifier(_) => OptionCode::ClientIdentifier as u8,
+            Self::RelayAgentInfo(_) => OptionCode::RelayAgentInfo as u8,
+            Self::InterfaceMtu(_) => OptionCode::InterfaceMtu as u8,
+            Self::Unknown(code, _) => *code,
+        }
+    }
+
     pub fn parse(code: u8, data: &[u8]) -> Result<Self> {
         match OptionCode::try_from(code) {
             Ok(OptionCode::SubnetMask) => {
@@ -451,5 +474,60 @@ mod tests {
         } else {
             panic!("Expected Unknown");
         }
+    }
+
+    #[test]
+    fn test_option_code() {
+        assert_eq!(
+            DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)).option_code(),
+            1
+        );
+        assert_eq!(
+            DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 1)]).option_code(),
+            3
+        );
+        assert_eq!(
+            DhcpOption::DnsServer(vec![Ipv4Addr::new(8, 8, 8, 8)]).option_code(),
+            6
+        );
+        assert_eq!(DhcpOption::Hostname("test".to_string()).option_code(), 12);
+        assert_eq!(
+            DhcpOption::DomainName("local".to_string()).option_code(),
+            15
+        );
+        assert_eq!(DhcpOption::InterfaceMtu(1500).option_code(), 26);
+        assert_eq!(
+            DhcpOption::BroadcastAddress(Ipv4Addr::new(192, 168, 1, 255)).option_code(),
+            28
+        );
+        assert_eq!(
+            DhcpOption::RequestedIpAddress(Ipv4Addr::new(192, 168, 1, 100)).option_code(),
+            50
+        );
+        assert_eq!(DhcpOption::LeaseTime(86400).option_code(), 51);
+        assert_eq!(
+            DhcpOption::OptionOverload(OverloadFlag::File).option_code(),
+            52
+        );
+        assert_eq!(
+            DhcpOption::MessageType(MessageType::Discover).option_code(),
+            53
+        );
+        assert_eq!(
+            DhcpOption::ServerIdentifier(Ipv4Addr::new(192, 168, 1, 1)).option_code(),
+            54
+        );
+        assert_eq!(
+            DhcpOption::ParameterRequestList(vec![1, 3, 6]).option_code(),
+            55
+        );
+        assert_eq!(DhcpOption::RenewalTime(43200).option_code(), 58);
+        assert_eq!(DhcpOption::RebindingTime(75600).option_code(), 59);
+        assert_eq!(
+            DhcpOption::ClientIdentifier(vec![1, 2, 3]).option_code(),
+            61
+        );
+        assert_eq!(DhcpOption::RelayAgentInfo(vec![1, 2, 3]).option_code(), 82);
+        assert_eq!(DhcpOption::Unknown(100, vec![1, 2, 3]).option_code(), 100);
     }
 }
