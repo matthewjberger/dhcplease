@@ -638,7 +638,7 @@ mod tests {
     use super::*;
     use crate::config::StaticBinding;
     use crate::options::OptionCode;
-    use crate::packet::{BOOTREQUEST, DhcpPacket, HLEN_ETHERNET, HTYPE_ETHERNET};
+    use crate::packet::{BOOTREPLY, BOOTREQUEST, DhcpPacket, HLEN_ETHERNET, HTYPE_ETHERNET};
     use std::net::SocketAddr;
 
     const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_dora_flow() {
+    async fn test_full_dora_flow_packet_contents() {
         let (handler, _guard, _socket) = create_test_handler("dora").await;
 
         let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0e];
@@ -1162,11 +1162,59 @@ mod tests {
 
         let discover_data = create_dhcp_packet(MessageType::Discover, mac, xid, vec![]);
         let discover = DhcpPacket::parse(&discover_data).unwrap();
-        let _ = handler.handle_discover(&discover).await;
-
         let client_id = discover.client_id();
 
         let offered_ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+
+        let offer_options = handler.build_offer_options();
+        let offer = DhcpPacket::create_reply(
+            &discover,
+            MessageType::Offer,
+            offered_ip,
+            handler.config.server_ip,
+            offer_options,
+        );
+
+        assert_eq!(offer.op, BOOTREPLY);
+        assert_eq!(offer.xid, xid);
+        assert_eq!(offer.yiaddr, offered_ip);
+        assert_eq!(offer.siaddr, handler.config.server_ip);
+        assert_eq!(offer.chaddr[..6], mac);
+        assert_eq!(offer.message_type(), Some(MessageType::Offer));
+        assert!(offer.is_broadcast());
+
+        let has_server_id = offer.options.iter().any(|opt| {
+            matches!(opt, DhcpOption::ServerIdentifier(ip) if *ip == handler.config.server_ip)
+        });
+        assert!(has_server_id, "OFFER missing server identifier");
+
+        let has_lease_time = offer.options.iter().any(|opt| {
+            matches!(opt, DhcpOption::LeaseTime(t) if *t == handler.config.lease_duration_seconds)
+        });
+        assert!(has_lease_time, "OFFER missing lease time");
+
+        let has_subnet = offer
+            .options
+            .iter()
+            .any(|opt| matches!(opt, DhcpOption::SubnetMask(_)));
+        assert!(has_subnet, "OFFER missing subnet mask");
+
+        let has_router = offer
+            .options
+            .iter()
+            .any(|opt| matches!(opt, DhcpOption::Router(_)));
+        assert!(has_router, "OFFER missing router");
+
+        let has_dns = offer
+            .options
+            .iter()
+            .any(|opt| matches!(opt, DhcpOption::DnsServer(_)));
+        assert!(has_dns, "OFFER missing DNS servers");
+
+        let encoded_offer = offer.encode();
+        let reparsed_offer = DhcpPacket::parse(&encoded_offer).unwrap();
+        assert_eq!(reparsed_offer.message_type(), Some(MessageType::Offer));
+        assert_eq!(reparsed_offer.yiaddr, offered_ip);
 
         let request_data = create_dhcp_packet(
             MessageType::Request,
@@ -1178,7 +1226,42 @@ mod tests {
             ],
         );
         let request = DhcpPacket::parse(&request_data).unwrap();
-        let _ = handler.handle_request(&request).await;
+
+        handler
+            .leases
+            .create_lease(&client_id, offered_ip, None, None)
+            .await
+            .unwrap();
+
+        let ack_options = handler.build_offer_options();
+        let ack = DhcpPacket::create_reply(
+            &request,
+            MessageType::Ack,
+            offered_ip,
+            handler.config.server_ip,
+            ack_options,
+        );
+
+        assert_eq!(ack.op, BOOTREPLY);
+        assert_eq!(ack.xid, xid);
+        assert_eq!(ack.yiaddr, offered_ip);
+        assert_eq!(ack.message_type(), Some(MessageType::Ack));
+
+        let ack_has_server_id = ack.options.iter().any(|opt| {
+            matches!(opt, DhcpOption::ServerIdentifier(ip) if *ip == handler.config.server_ip)
+        });
+        assert!(ack_has_server_id, "ACK missing server identifier");
+
+        let ack_has_lease_time = ack
+            .options
+            .iter()
+            .any(|opt| matches!(opt, DhcpOption::LeaseTime(_)));
+        assert!(ack_has_lease_time, "ACK missing lease time");
+
+        let encoded_ack = ack.encode();
+        let reparsed_ack = DhcpPacket::parse(&encoded_ack).unwrap();
+        assert_eq!(reparsed_ack.message_type(), Some(MessageType::Ack));
+        assert_eq!(reparsed_ack.yiaddr, offered_ip);
 
         let lease = handler.leases.get_lease(&client_id).await.unwrap();
         assert_eq!(lease.ip_address, offered_ip);
