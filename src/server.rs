@@ -25,7 +25,7 @@ pub struct DhcpServer {
     config: Arc<Config>,
     leases: Arc<Leases>,
     socket: Arc<UdpSocket>,
-    rate_limiter: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    rate_limiter: Arc<Mutex<HashMap<[u8; 6], Vec<Instant>>>>,
 }
 
 impl DhcpServer {
@@ -156,11 +156,11 @@ struct PacketHandler {
     config: Arc<Config>,
     leases: Arc<Leases>,
     socket: Arc<UdpSocket>,
-    rate_limiter: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    rate_limiter: Arc<Mutex<HashMap<[u8; 6], Vec<Instant>>>>,
 }
 
 impl PacketHandler {
-    async fn is_rate_limited(&self, key: &str) -> bool {
+    async fn is_rate_limited(&self, mac: [u8; 6]) -> bool {
         let mut limiter = self.rate_limiter.lock().await;
         let now = Instant::now();
         let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
@@ -172,7 +172,7 @@ impl PacketHandler {
             });
         }
 
-        let timestamps = limiter.entry(key.to_string()).or_default();
+        let timestamps = limiter.entry(mac).or_default();
         timestamps.retain(|t| now.duration_since(*t) < window);
 
         if timestamps.len() >= RATE_LIMIT_MAX_REQUESTS {
@@ -190,9 +190,10 @@ impl PacketHandler {
             return Err(Error::InvalidPacket("Expected BOOTREQUEST".to_string()));
         }
 
+        let mac_bytes: [u8; 6] = packet.chaddr[..6].try_into().unwrap_or([0; 6]);
         let mac = packet.format_mac();
 
-        if self.is_rate_limited(&mac).await {
+        if self.is_rate_limited(mac_bytes).await {
             warn!("Rate limited: {} from {}", mac, source);
             return Ok(());
         }
@@ -239,7 +240,7 @@ impl PacketHandler {
 
         let hostname = packet.hostname().map(crate::config::sanitize_hostname);
         self.leases
-            .create_lease(&client_id, assigned_ip, hostname)
+            .create_lease(&client_id, assigned_ip, hostname, Some(u32::MAX))
             .await?;
 
         let mut options = Vec::new();
@@ -332,6 +333,8 @@ impl PacketHandler {
             return self.send_nak(packet, "Requested IP not in pool").await;
         }
 
+        let lease_duration = self.negotiate_lease_time(packet);
+
         let existing_lease = self.leases.get_lease(&client_id).await;
         let is_renewal = existing_lease
             .as_ref()
@@ -339,12 +342,12 @@ impl PacketHandler {
 
         let hostname = packet.hostname().map(sanitize_hostname);
         let lease = if is_renewal {
-            match self.leases.renew_lease(&client_id).await {
+            match self.leases.renew_lease(&client_id, Some(lease_duration)).await {
                 Ok(lease) => lease,
                 Err(Error::LeaseNotFound(_)) => {
                     match self
                         .leases
-                        .create_lease(&client_id, requested_ip, hostname)
+                        .create_lease(&client_id, requested_ip, hostname, Some(lease_duration))
                         .await
                     {
                         Ok(lease) => lease,
@@ -365,7 +368,7 @@ impl PacketHandler {
         } else {
             match self
                 .leases
-                .create_lease(&client_id, requested_ip, hostname)
+                .create_lease(&client_id, requested_ip, hostname, Some(lease_duration))
                 .await
             {
                 Ok(lease) => lease,
@@ -410,6 +413,15 @@ impl PacketHandler {
 
     fn is_static_binding(&self, client_id: &[u8], ip: Ipv4Addr) -> bool {
         self.leases.is_static_binding(client_id, ip)
+    }
+
+    fn negotiate_lease_time(&self, packet: &DhcpPacket) -> u32 {
+        const MIN_LEASE_SECONDS: u32 = 60;
+        let max_lease = self.config.lease_duration_seconds;
+        match packet.requested_lease_time() {
+            Some(requested) => requested.clamp(MIN_LEASE_SECONDS, max_lease),
+            None => max_lease,
+        }
     }
 
     async fn handle_release(&self, packet: &DhcpPacket) -> Result<()> {
@@ -798,7 +810,7 @@ mod tests {
     async fn test_rate_limiting() {
         let (handler, _guard, _socket) = create_test_handler("rate_limit").await;
 
-        let mac = "aa:bb:cc:dd:ee:ff";
+        let mac: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
 
         for _ in 0..RATE_LIMIT_MAX_REQUESTS {
             assert!(!handler.is_rate_limited(mac).await);
@@ -806,7 +818,7 @@ mod tests {
 
         assert!(handler.is_rate_limited(mac).await);
 
-        let other_mac = "11:22:33:44:55:66";
+        let other_mac: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
         assert!(!handler.is_rate_limited(other_mac).await);
     }
 
@@ -816,8 +828,15 @@ mod tests {
 
         let total_macs = RATE_LIMIT_CLEANUP_THRESHOLD + 10;
         for index in 0..total_macs {
-            let mac = format!("aa:bb:cc:dd:{:02x}:{:02x}", index / 256, index % 256);
-            handler.is_rate_limited(&mac).await;
+            let mac: [u8; 6] = [
+                0xaa,
+                0xbb,
+                0xcc,
+                0xdd,
+                (index / 256) as u8,
+                (index % 256) as u8,
+            ];
+            handler.is_rate_limited(mac).await;
         }
 
         let limiter = handler.rate_limiter.lock().await;
@@ -908,7 +927,7 @@ mod tests {
         let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
         handler
             .leases
-            .create_lease(&client_id, ip, None)
+            .create_lease(&client_id, ip, None, None)
             .await
             .unwrap();
 
@@ -981,7 +1000,7 @@ mod tests {
         let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
         handler
             .leases
-            .create_lease(&client_id, ip, None)
+            .create_lease(&client_id, ip, None, None)
             .await
             .unwrap();
 
@@ -1027,7 +1046,7 @@ mod tests {
         let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
         handler
             .leases
-            .create_lease(&client_id, ip, None)
+            .create_lease(&client_id, ip, None, None)
             .await
             .unwrap();
 
@@ -1180,7 +1199,7 @@ mod tests {
         let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
         handler
             .leases
-            .create_lease(&client_id, ip, None)
+            .create_lease(&client_id, ip, None, None)
             .await
             .unwrap();
 
@@ -1427,7 +1446,7 @@ mod tests {
             let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
             handler
                 .leases
-                .create_lease(&client_id, ip, None)
+                .create_lease(&client_id, ip, None, None)
                 .await
                 .unwrap();
         }

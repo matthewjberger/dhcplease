@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
@@ -81,6 +81,7 @@ struct InternalState {
     store: LeaseStore,
     free_ips: BTreeSet<Ipv4Addr>,
     pending_offers: HashMap<String, PendingOffer>,
+    pending_ips: HashSet<Ipv4Addr>,
     dirty: bool,
     last_save: Instant,
 }
@@ -122,6 +123,7 @@ impl Leases {
             store,
             free_ips,
             pending_offers: HashMap::new(),
+            pending_ips: HashSet::new(),
             dirty: false,
             last_save: Instant::now(),
         };
@@ -228,22 +230,16 @@ impl Leases {
         }
 
         for ip in state.free_ips.iter().copied() {
-            if !state.store.declined_ips.contains_key(&ip) {
-                let is_pending = state
-                    .pending_offers
-                    .values()
-                    .any(|offer| offer.ip == ip && offer.expires_at > Instant::now());
-
-                if !is_pending {
-                    state.pending_offers.insert(
-                        key,
-                        PendingOffer {
-                            ip,
-                            expires_at: Instant::now() + Duration::from_secs(OFFER_TIMEOUT_SECONDS),
-                        },
-                    );
-                    return Ok(ip);
-                }
+            if !state.store.declined_ips.contains_key(&ip) && !state.pending_ips.contains(&ip) {
+                state.pending_offers.insert(
+                    key,
+                    PendingOffer {
+                        ip,
+                        expires_at: Instant::now() + Duration::from_secs(OFFER_TIMEOUT_SECONDS),
+                    },
+                );
+                state.pending_ips.insert(ip);
+                return Ok(ip);
             }
         }
 
@@ -252,6 +248,15 @@ impl Leases {
 
     fn cleanup_pending_offers(&self, state: &mut InternalState) {
         let now = Instant::now();
+        let expired_ips: Vec<Ipv4Addr> = state
+            .pending_offers
+            .iter()
+            .filter(|(_, offer)| offer.expires_at <= now)
+            .map(|(_, offer)| offer.ip)
+            .collect();
+        for ip in expired_ips {
+            state.pending_ips.remove(&ip);
+        }
         state
             .pending_offers
             .retain(|_, offer| offer.expires_at > now);
@@ -260,6 +265,10 @@ impl Leases {
     pub async fn track_pending_offer(&self, client_id: &[u8], ip: Ipv4Addr) {
         let key = encode_client_id(client_id);
         let mut state = self.state.write().await;
+        if let Some(old_offer) = state.pending_offers.get(&key) {
+            let old_ip = old_offer.ip;
+            state.pending_ips.remove(&old_ip);
+        }
         state.pending_offers.insert(
             key,
             PendingOffer {
@@ -267,6 +276,7 @@ impl Leases {
                 expires_at: Instant::now() + Duration::from_secs(OFFER_TIMEOUT_SECONDS),
             },
         );
+        state.pending_ips.insert(ip);
     }
 
     pub async fn create_lease(
@@ -274,6 +284,7 @@ impl Leases {
         client_id: &[u8],
         ip_address: Ipv4Addr,
         hostname: Option<String>,
+        duration_seconds: Option<u32>,
     ) -> Result<Lease> {
         let key = encode_client_id(client_id);
         let mut state = self.state.write().await;
@@ -304,9 +315,12 @@ impl Leases {
             return Err(Error::InvalidPacket("IP already leased".to_string()));
         }
 
-        state.pending_offers.remove(&key);
+        if let Some(old_offer) = state.pending_offers.remove(&key) {
+            state.pending_ips.remove(&old_offer.ip);
+        }
 
-        let mut lease = Lease::new(ip_address, key.clone(), self.config.lease_duration_seconds);
+        let duration = duration_seconds.unwrap_or(self.config.lease_duration_seconds);
+        let mut lease = Lease::new(ip_address, key.clone(), duration);
         lease.hostname = hostname;
 
         let old_ip = state
@@ -333,7 +347,11 @@ impl Leases {
         Ok(lease)
     }
 
-    pub async fn renew_lease(&self, client_id: &[u8]) -> Result<Lease> {
+    pub async fn renew_lease(
+        &self,
+        client_id: &[u8],
+        duration_seconds: Option<u32>,
+    ) -> Result<Lease> {
         let key = encode_client_id(client_id);
         let mut state = self.state.write().await;
 
@@ -343,7 +361,8 @@ impl Leases {
             .get_mut(&key)
             .ok_or_else(|| Error::LeaseNotFound(key.clone()))?;
 
-        lease.renew(self.config.lease_duration_seconds);
+        let duration = duration_seconds.unwrap_or(self.config.lease_duration_seconds);
+        lease.renew(duration);
         let lease = lease.clone();
         state.dirty = true;
 
@@ -605,7 +624,7 @@ mod tests {
         assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 100));
 
         let lease = manager
-            .create_lease(&client_id, ip, Some("test-host".to_string()))
+            .create_lease(&client_id, ip, Some("test-host".to_string()), None)
             .await
             .unwrap();
         assert_eq!(lease.hostname, Some("test-host".to_string()));
@@ -614,7 +633,7 @@ mod tests {
         assert!(manager.get_lease_by_ip(ip).await.is_some());
         assert_eq!(manager.active_lease_count().await, 1);
 
-        let renewed = manager.renew_lease(&client_id).await.unwrap();
+        let renewed = manager.renew_lease(&client_id, None).await.unwrap();
         assert_eq!(renewed.ip_address, ip);
 
         manager.release_lease(&client_id, ip).await.unwrap();
@@ -629,7 +648,7 @@ mod tests {
         let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
 
         let ip1 = manager.allocate_ip(&client1).await.unwrap();
-        manager.create_lease(&client1, ip1, None).await.unwrap();
+        manager.create_lease(&client1, ip1, None, None).await.unwrap();
 
         let ip2 = manager.allocate_ip(&client2).await.unwrap();
         assert_ne!(ip1, ip2);
@@ -710,7 +729,7 @@ mod tests {
             let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, index]);
             handles.push(tokio::spawn(async move {
                 let ip = leases_clone.allocate_ip(&client_id).await?;
-                leases_clone.create_lease(&client_id, ip, None).await?;
+                leases_clone.create_lease(&client_id, ip, None, None).await?;
                 Ok::<_, crate::error::Error>(ip)
             }));
         }
@@ -732,7 +751,7 @@ mod tests {
         let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
 
         let ip = leases.allocate_ip(&client1).await.unwrap();
-        leases.create_lease(&client1, ip, None).await.unwrap();
+        leases.create_lease(&client1, ip, None, None).await.unwrap();
 
         let leases_clone = Arc::clone(&leases);
         let client1_clone = client1.clone();
@@ -758,7 +777,7 @@ mod tests {
         assert_eq!(manager.free_ip_count().await, 11);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None).await.unwrap();
+        manager.create_lease(&client_id, ip, None, None).await.unwrap();
 
         assert_eq!(manager.free_ip_count().await, 10);
 
@@ -774,7 +793,7 @@ mod tests {
         let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None).await.unwrap();
+        manager.create_lease(&client_id, ip, None, None).await.unwrap();
 
         let wrong_ip = Ipv4Addr::new(192, 168, 1, 200);
         let result = manager.release_lease(&client_id, wrong_ip).await;
@@ -820,7 +839,7 @@ mod tests {
         let wrong_client = make_client_id(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
         let static_ip = Ipv4Addr::new(192, 168, 1, 50);
 
-        let result = manager.create_lease(&wrong_client, static_ip, None).await;
+        let result = manager.create_lease(&wrong_client, static_ip, None, None).await;
         assert!(result.is_err());
     }
 
@@ -857,7 +876,7 @@ mod tests {
             let manager = Leases::new(Arc::clone(&config)).await.unwrap();
             ip = manager.allocate_ip(&client_id).await.unwrap();
             manager
-                .create_lease(&client_id, ip, Some("persist-test".to_string()))
+                .create_lease(&client_id, ip, Some("persist-test".to_string()), None)
                 .await
                 .unwrap();
             manager.save().await.unwrap();
@@ -880,7 +899,7 @@ mod tests {
         let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None).await.unwrap();
+        manager.create_lease(&client_id, ip, None, None).await.unwrap();
 
         {
             let mut state = manager.state.write().await;
@@ -907,9 +926,9 @@ mod tests {
         let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
 
         let ip = manager.allocate_ip(&client1).await.unwrap();
-        manager.create_lease(&client1, ip, None).await.unwrap();
+        manager.create_lease(&client1, ip, None, None).await.unwrap();
 
-        let result = manager.create_lease(&client2, ip, None).await;
+        let result = manager.create_lease(&client2, ip, None, None).await;
         assert!(result.is_err());
     }
 
@@ -920,9 +939,9 @@ mod tests {
         let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None).await.unwrap();
+        manager.create_lease(&client_id, ip, None, None).await.unwrap();
 
-        let result = manager.create_lease(&client_id, ip, None).await;
+        let result = manager.create_lease(&client_id, ip, None, None).await;
         assert!(result.is_ok());
     }
 
@@ -933,10 +952,10 @@ mod tests {
         let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
         let ip1 = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip1, None).await.unwrap();
+        manager.create_lease(&client_id, ip1, None, None).await.unwrap();
 
         let ip2 = Ipv4Addr::new(192, 168, 1, 105);
-        manager.create_lease(&client_id, ip2, None).await.unwrap();
+        manager.create_lease(&client_id, ip2, None, None).await.unwrap();
 
         let lease = manager.get_lease(&client_id).await.unwrap();
         assert_eq!(lease.ip_address, ip2);
@@ -979,10 +998,10 @@ mod tests {
         let client3 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x03]);
 
         let ip1 = manager.allocate_ip(&client1).await.unwrap();
-        manager.create_lease(&client1, ip1, None).await.unwrap();
+        manager.create_lease(&client1, ip1, None, None).await.unwrap();
 
         let ip2 = manager.allocate_ip(&client2).await.unwrap();
-        manager.create_lease(&client2, ip2, None).await.unwrap();
+        manager.create_lease(&client2, ip2, None, None).await.unwrap();
 
         let result = manager.allocate_ip(&client3).await;
         assert!(matches!(result, Err(crate::error::Error::PoolExhausted)));
@@ -996,7 +1015,7 @@ mod tests {
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
         manager
-            .create_lease(&client_id, ip, Some("test-host".to_string()))
+            .create_lease(&client_id, ip, Some("test-host".to_string()), None)
             .await
             .unwrap();
 
@@ -1016,7 +1035,7 @@ mod tests {
         let manager = Leases::new(config).await.unwrap();
         let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
-        let result = manager.renew_lease(&client_id).await;
+        let result = manager.renew_lease(&client_id, None).await;
         assert!(matches!(result, Err(crate::error::Error::LeaseNotFound(_))));
     }
 
@@ -1040,10 +1059,10 @@ mod tests {
         let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
 
         let ip1 = manager.allocate_ip(&client1).await.unwrap();
-        manager.create_lease(&client1, ip1, None).await.unwrap();
+        manager.create_lease(&client1, ip1, None, None).await.unwrap();
 
         let ip2 = manager.allocate_ip(&client2).await.unwrap();
-        manager.create_lease(&client2, ip2, None).await.unwrap();
+        manager.create_lease(&client2, ip2, None, None).await.unwrap();
 
         let leases = manager.list_leases().await;
         assert_eq!(leases.len(), 2);
@@ -1058,7 +1077,7 @@ mod tests {
         assert_eq!(manager.active_lease_count().await, 0);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None).await.unwrap();
+        manager.create_lease(&client_id, ip, None, None).await.unwrap();
 
         assert_eq!(manager.active_lease_count().await, 1);
     }

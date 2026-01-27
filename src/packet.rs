@@ -297,6 +297,15 @@ impl DhcpPacket {
         None
     }
 
+    pub fn requested_lease_time(&self) -> Option<u32> {
+        for option in &self.options {
+            if let DhcpOption::LeaseTime(time) = option {
+                return Some(*time);
+            }
+        }
+        None
+    }
+
     pub fn chaddr_bytes(&self) -> &[u8] {
         &self.chaddr[..self.hlen as usize]
     }
