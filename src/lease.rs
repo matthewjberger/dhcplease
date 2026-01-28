@@ -827,7 +827,10 @@ mod tests {
         let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
 
         let ip1 = manager.allocate_ip(&client1).await.unwrap();
-        manager.create_lease(&client1, ip1, None, None).await.unwrap();
+        manager
+            .create_lease(&client1, ip1, None, None)
+            .await
+            .unwrap();
 
         let ip2 = manager.allocate_ip(&client2).await.unwrap();
         assert_ne!(ip1, ip2);
@@ -908,7 +911,9 @@ mod tests {
             let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, index]);
             handles.push(tokio::spawn(async move {
                 let ip = leases_clone.allocate_ip(&client_id).await?;
-                leases_clone.create_lease(&client_id, ip, None, None).await?;
+                leases_clone
+                    .create_lease(&client_id, ip, None, None)
+                    .await?;
                 Ok::<_, crate::error::Error>(ip)
             }));
         }
@@ -956,7 +961,10 @@ mod tests {
         assert_eq!(manager.free_ip_count().await, 11);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None, None).await.unwrap();
+        manager
+            .create_lease(&client_id, ip, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(manager.free_ip_count().await, 10);
 
@@ -972,7 +980,10 @@ mod tests {
         let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None, None).await.unwrap();
+        manager
+            .create_lease(&client_id, ip, None, None)
+            .await
+            .unwrap();
 
         let wrong_ip = Ipv4Addr::new(192, 168, 1, 200);
         let result = manager.release_lease(&client_id, wrong_ip).await;
@@ -1018,7 +1029,9 @@ mod tests {
         let wrong_client = make_client_id(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
         let static_ip = Ipv4Addr::new(192, 168, 1, 50);
 
-        let result = manager.create_lease(&wrong_client, static_ip, None, None).await;
+        let result = manager
+            .create_lease(&wrong_client, static_ip, None, None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -1078,7 +1091,10 @@ mod tests {
         let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None, None).await.unwrap();
+        manager
+            .create_lease(&client_id, ip, None, None)
+            .await
+            .unwrap();
 
         {
             let mut state = manager.state.write().await;
@@ -1105,7 +1121,10 @@ mod tests {
         let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
 
         let ip = manager.allocate_ip(&client1).await.unwrap();
-        manager.create_lease(&client1, ip, None, None).await.unwrap();
+        manager
+            .create_lease(&client1, ip, None, None)
+            .await
+            .unwrap();
 
         let result = manager.create_lease(&client2, ip, None, None).await;
         assert!(result.is_err());
@@ -1118,7 +1137,10 @@ mod tests {
         let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None, None).await.unwrap();
+        manager
+            .create_lease(&client_id, ip, None, None)
+            .await
+            .unwrap();
 
         let result = manager.create_lease(&client_id, ip, None, None).await;
         assert!(result.is_ok());
@@ -1131,10 +1153,16 @@ mod tests {
         let client_id = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
         let ip1 = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip1, None, None).await.unwrap();
+        manager
+            .create_lease(&client_id, ip1, None, None)
+            .await
+            .unwrap();
 
         let ip2 = Ipv4Addr::new(192, 168, 1, 105);
-        manager.create_lease(&client_id, ip2, None, None).await.unwrap();
+        manager
+            .create_lease(&client_id, ip2, None, None)
+            .await
+            .unwrap();
 
         let lease = manager.get_lease(&client_id).await.unwrap();
         assert_eq!(lease.ip_address, ip2);
@@ -1177,10 +1205,16 @@ mod tests {
         let client3 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x03]);
 
         let ip1 = manager.allocate_ip(&client1).await.unwrap();
-        manager.create_lease(&client1, ip1, None, None).await.unwrap();
+        manager
+            .create_lease(&client1, ip1, None, None)
+            .await
+            .unwrap();
 
         let ip2 = manager.allocate_ip(&client2).await.unwrap();
-        manager.create_lease(&client2, ip2, None, None).await.unwrap();
+        manager
+            .create_lease(&client2, ip2, None, None)
+            .await
+            .unwrap();
 
         let result = manager.allocate_ip(&client3).await;
         assert!(matches!(result, Err(crate::error::Error::PoolExhausted)));
@@ -1238,10 +1272,16 @@ mod tests {
         let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
 
         let ip1 = manager.allocate_ip(&client1).await.unwrap();
-        manager.create_lease(&client1, ip1, None, None).await.unwrap();
+        manager
+            .create_lease(&client1, ip1, None, None)
+            .await
+            .unwrap();
 
         let ip2 = manager.allocate_ip(&client2).await.unwrap();
-        manager.create_lease(&client2, ip2, None, None).await.unwrap();
+        manager
+            .create_lease(&client2, ip2, None, None)
+            .await
+            .unwrap();
 
         let leases = manager.list_leases().await;
         assert_eq!(leases.len(), 2);
@@ -1256,8 +1296,285 @@ mod tests {
         assert_eq!(manager.active_lease_count().await, 0);
 
         let ip = manager.allocate_ip(&client_id).await.unwrap();
-        manager.create_lease(&client_id, ip, None, None).await.unwrap();
+        manager
+            .create_lease(&client_id, ip, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(manager.active_lease_count().await, 1);
+    }
+
+    #[test]
+    fn test_lease_is_expired_boundary() {
+        let lease = Lease::new(Ipv4Addr::new(192, 168, 1, 100), "test".to_string(), 1);
+        assert!(
+            !lease.is_expired(),
+            "Lease with 1 second duration should not be immediately expired"
+        );
+
+        let mut future_lease = Lease::new(Ipv4Addr::new(192, 168, 1, 100), "test".to_string(), 0);
+        future_lease.expires_at = Utc::now() + TimeDelta::seconds(10);
+        assert!(
+            !future_lease.is_expired(),
+            "Lease expiring in the future should not be expired"
+        );
+
+        let mut just_expired = Lease::new(Ipv4Addr::new(192, 168, 1, 100), "test".to_string(), 0);
+        just_expired.expires_at = Utc::now() - TimeDelta::seconds(1);
+        assert!(
+            just_expired.is_expired(),
+            "Lease expiring 1s ago should be expired"
+        );
+
+        let mut long_expired = Lease::new(Ipv4Addr::new(192, 168, 1, 100), "test".to_string(), 0);
+        long_expired.expires_at = Utc::now() - TimeDelta::hours(1);
+        assert!(
+            long_expired.is_expired(),
+            "Lease expired an hour ago should be expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_ip_available_for_different_client() {
+        let (config, _guard) = test_config("ip_avail_diff");
+        let manager = Leases::new(config).await.unwrap();
+
+        let client1 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
+
+        let ip = manager.allocate_ip(&client1).await.unwrap();
+        manager
+            .create_lease(&client1, ip, None, None)
+            .await
+            .unwrap();
+
+        assert!(
+            manager.is_ip_available(ip, &client1).await,
+            "IP should be available to the client that leased it"
+        );
+        assert!(
+            !manager.is_ip_available(ip, &client2).await,
+            "IP should NOT be available to a different client"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_ip_available_pending_offer() {
+        let (config, _guard) = test_config("ip_avail_pending");
+        let manager = Leases::new(config).await.unwrap();
+
+        let client1 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
+
+        let ip = manager.allocate_ip(&client1).await.unwrap();
+
+        assert!(
+            manager.is_ip_available(ip, &client1).await,
+            "IP should be available to client with pending offer"
+        );
+        assert!(
+            !manager.is_ip_available(ip, &client2).await,
+            "IP should NOT be available to different client when pending for another"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_ip_available_declined() {
+        let (config, _guard) = test_config("ip_avail_declined");
+        let manager = Leases::new(config).await.unwrap();
+
+        let client1 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
+
+        let ip = Ipv4Addr::new(192, 168, 1, 100);
+        manager.decline_ip(ip, &client1).await.unwrap();
+
+        assert!(
+            !manager.is_ip_available(ip, &client1).await,
+            "Declined IP should not be available"
+        );
+        assert!(
+            !manager.is_ip_available(ip, &client2).await,
+            "Declined IP should not be available to any client"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_ip_available_free() {
+        let (config, _guard) = test_config("ip_avail_free");
+        let manager = Leases::new(config).await.unwrap();
+
+        let client = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        let ip = Ipv4Addr::new(192, 168, 1, 100);
+
+        assert!(
+            manager.is_ip_available(ip, &client).await,
+            "Free IP should be available"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_pending_offers_expiration() {
+        let (config, _guard) = test_config("pending_expire");
+        let manager = Leases::new(config).await.unwrap();
+
+        let client1 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        let client2 = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
+
+        let ip1 = manager.allocate_ip(&client1).await.unwrap();
+
+        {
+            let mut state = manager.state.write().await;
+            if let Some(offer) = state.pending_offers.get_mut(&encode_client_id(&client1)) {
+                offer.expires_at = Instant::now() - Duration::from_secs(1);
+            }
+        }
+
+        let ip2 = manager.allocate_ip(&client2).await.unwrap();
+
+        assert_eq!(ip1, Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(
+            ip2,
+            Ipv4Addr::new(192, 168, 1, 100),
+            "After pending offer expires, IP should be reallocated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_allocate_returns_existing_lease() {
+        let (config, _guard) = test_config("alloc_existing");
+        let manager = Leases::new(config).await.unwrap();
+
+        let client = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+
+        let ip1 = manager.allocate_ip(&client).await.unwrap();
+        manager
+            .create_lease(&client, ip1, None, None)
+            .await
+            .unwrap();
+
+        let ip2 = manager.allocate_ip(&client).await.unwrap();
+        assert_eq!(ip1, ip2, "allocate_ip should return existing lease IP");
+    }
+
+    #[tokio::test]
+    async fn test_create_lease_releases_old_ip() {
+        let (config, _guard) = test_config("create_releases_old");
+        let manager = Leases::new(config).await.unwrap();
+
+        let client = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+
+        let ip1 = manager.allocate_ip(&client).await.unwrap();
+        manager
+            .create_lease(&client, ip1, None, None)
+            .await
+            .unwrap();
+
+        let initial_free = manager.free_ip_count().await;
+
+        let ip2 = Ipv4Addr::new(192, 168, 1, 105);
+        manager
+            .create_lease(&client, ip2, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.free_ip_count().await,
+            initial_free,
+            "Old IP should be returned to pool when client gets new IP"
+        );
+
+        let other_client = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02]);
+        assert!(
+            manager.is_ip_available(ip1, &other_client).await,
+            "Old IP should be available to other clients"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decline_removes_lease() {
+        let (config, _guard) = test_config("decline_removes");
+        let manager = Leases::new(config).await.unwrap();
+
+        let client = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+
+        let ip = manager.allocate_ip(&client).await.unwrap();
+        manager.create_lease(&client, ip, None, None).await.unwrap();
+
+        assert!(manager.get_lease(&client).await.is_some());
+
+        manager.decline_ip(ip, &client).await.unwrap();
+
+        assert!(
+            manager.get_lease(&client).await.is_none(),
+            "Declining leased IP should remove the lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_returns_zero_when_none_expired() {
+        let (config, _guard) = test_config("cleanup_none");
+        let manager = Leases::new(config).await.unwrap();
+
+        let client = make_client_id(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        let ip = manager.allocate_ip(&client).await.unwrap();
+        manager.create_lease(&client, ip, None, None).await.unwrap();
+
+        let count = manager.cleanup_expired_leases().await.unwrap();
+        assert_eq!(count, 0, "No leases should be cleaned up");
+
+        assert!(
+            manager.get_lease(&client).await.is_some(),
+            "Non-expired lease should still exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_static_binding_client_id_format() {
+        let path = "test_leases_static_format.json".to_string();
+        let _guard = TestGuard(path.clone());
+
+        let config = Arc::new(Config {
+            static_bindings: vec![StaticBinding {
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                ip_address: Ipv4Addr::new(192, 168, 1, 50),
+                hostname: None,
+            }],
+            leases_file: path,
+            ..Config {
+                server_ip: Ipv4Addr::new(192, 168, 1, 1),
+                subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+                pool_start: Ipv4Addr::new(192, 168, 1, 100),
+                pool_end: Ipv4Addr::new(192, 168, 1, 110),
+                gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8)],
+                domain_name: None,
+                lease_duration_seconds: 3600,
+                renewal_time_seconds: None,
+                rebinding_time_seconds: None,
+                broadcast_address: None,
+                mtu: None,
+                static_bindings: vec![],
+                leases_file: String::new(),
+                interface_index: None,
+            }
+        });
+
+        let manager = Leases::new(config).await.unwrap();
+
+        let ethernet_client_id = vec![1u8, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        assert!(manager.is_static_binding(&ethernet_client_id, Ipv4Addr::new(192, 168, 1, 50)));
+
+        let wrong_length = vec![1u8, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        assert!(
+            !manager.is_static_binding(&wrong_length, Ipv4Addr::new(192, 168, 1, 50)),
+            "Client ID with wrong length should not match static binding"
+        );
+
+        let wrong_htype = vec![2u8, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        assert!(
+            !manager.is_static_binding(&wrong_htype, Ipv4Addr::new(192, 168, 1, 50)),
+            "Client ID with non-Ethernet htype should not match static binding"
+        );
     }
 }

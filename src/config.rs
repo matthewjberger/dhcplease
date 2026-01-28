@@ -508,4 +508,331 @@ mod tests {
         assert_eq!(sanitize_domain_name("example.local"), "example.local");
         assert_eq!(sanitize_domain_name("bad\x00domain"), "baddomain");
     }
+
+    #[test]
+    fn test_pool_boundary_validation() {
+        let equal_boundaries = Config {
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 100),
+            ..Default::default()
+        };
+        assert!(
+            equal_boundaries.validate().is_ok(),
+            "Pool with start == end should be valid (single IP pool)"
+        );
+
+        let start_greater = Config {
+            pool_start: Ipv4Addr::new(192, 168, 1, 101),
+            pool_end: Ipv4Addr::new(192, 168, 1, 100),
+            ..Default::default()
+        };
+        assert!(
+            start_greater.validate().is_err(),
+            "Pool with start > end should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_server_ip_pool_boundary() {
+        let server_at_start = Config {
+            server_ip: Ipv4Addr::new(192, 168, 1, 100),
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 200),
+            ..Default::default()
+        };
+        assert!(
+            server_at_start.validate().is_err(),
+            "Server IP at pool start should be invalid"
+        );
+
+        let server_at_end = Config {
+            server_ip: Ipv4Addr::new(192, 168, 1, 200),
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 200),
+            ..Default::default()
+        };
+        assert!(
+            server_at_end.validate().is_err(),
+            "Server IP at pool end should be invalid"
+        );
+
+        let server_just_before = Config {
+            server_ip: Ipv4Addr::new(192, 168, 1, 99),
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 200),
+            ..Default::default()
+        };
+        assert!(
+            server_just_before.validate().is_ok(),
+            "Server IP just before pool should be valid"
+        );
+
+        let server_just_after = Config {
+            server_ip: Ipv4Addr::new(192, 168, 1, 201),
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 200),
+            ..Default::default()
+        };
+        assert!(
+            server_just_after.validate().is_ok(),
+            "Server IP just after pool should be valid"
+        );
+    }
+
+    #[test]
+    fn test_gateway_pool_boundary() {
+        let gateway_at_start = Config {
+            gateway: Some(Ipv4Addr::new(192, 168, 1, 100)),
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 200),
+            ..Default::default()
+        };
+        assert!(
+            gateway_at_start.validate().is_err(),
+            "Gateway at pool start should be invalid"
+        );
+
+        let gateway_at_end = Config {
+            gateway: Some(Ipv4Addr::new(192, 168, 1, 200)),
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 200),
+            ..Default::default()
+        };
+        assert!(
+            gateway_at_end.validate().is_err(),
+            "Gateway at pool end should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_is_valid_mac_detailed() {
+        assert!(Config::is_valid_mac("00:00:00:00:00:00"));
+        assert!(Config::is_valid_mac("ff:ff:ff:ff:ff:ff"));
+        assert!(Config::is_valid_mac("aA:bB:cC:dD:eE:fF"));
+
+        assert!(
+            !Config::is_valid_mac("aa:bb:cc:dd:ee"),
+            "MAC with only 5 octets should be invalid"
+        );
+        assert!(
+            !Config::is_valid_mac("aa:bb:cc:dd:ee:ff:00"),
+            "MAC with 7 octets should be invalid"
+        );
+        assert!(
+            !Config::is_valid_mac("ag:bb:cc:dd:ee:ff"),
+            "MAC with non-hex character should be invalid"
+        );
+        assert!(
+            !Config::is_valid_mac("a:bb:cc:dd:ee:ff"),
+            "MAC with single-digit octet should be invalid"
+        );
+        assert!(
+            !Config::is_valid_mac("aaa:bb:cc:dd:ee:ff"),
+            "MAC with triple-digit octet should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_ip_in_pool_boundaries() {
+        let config = Config {
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 200),
+            ..Default::default()
+        };
+
+        assert!(
+            config.ip_in_pool(Ipv4Addr::new(192, 168, 1, 100)),
+            "Pool start should be in pool"
+        );
+        assert!(
+            config.ip_in_pool(Ipv4Addr::new(192, 168, 1, 200)),
+            "Pool end should be in pool"
+        );
+        assert!(
+            config.ip_in_pool(Ipv4Addr::new(192, 168, 1, 150)),
+            "Middle of pool should be in pool"
+        );
+
+        assert!(
+            !config.ip_in_pool(Ipv4Addr::new(192, 168, 1, 99)),
+            "Just before pool should not be in pool"
+        );
+        assert!(
+            !config.ip_in_pool(Ipv4Addr::new(192, 168, 1, 201)),
+            "Just after pool should not be in pool"
+        );
+    }
+
+    #[test]
+    fn test_pool_size_calculation() {
+        let single_ip = Config {
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 100),
+            ..Default::default()
+        };
+        assert_eq!(single_ip.pool_size(), 1);
+
+        let two_ips = Config {
+            pool_start: Ipv4Addr::new(192, 168, 1, 100),
+            pool_end: Ipv4Addr::new(192, 168, 1, 101),
+            ..Default::default()
+        };
+        assert_eq!(two_ips.pool_size(), 2);
+    }
+
+    #[test]
+    fn test_static_binding_duplicate_detection() {
+        let duplicate_mac = Config {
+            static_bindings: vec![
+                StaticBinding {
+                    mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                    ip_address: Ipv4Addr::new(192, 168, 1, 50),
+                    hostname: None,
+                },
+                StaticBinding {
+                    mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                    ip_address: Ipv4Addr::new(192, 168, 1, 51),
+                    hostname: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            duplicate_mac.validate().is_err(),
+            "Duplicate MAC addresses should be rejected"
+        );
+
+        let duplicate_ip = Config {
+            static_bindings: vec![
+                StaticBinding {
+                    mac_address: "aa:bb:cc:dd:ee:01".to_string(),
+                    ip_address: Ipv4Addr::new(192, 168, 1, 50),
+                    hostname: None,
+                },
+                StaticBinding {
+                    mac_address: "aa:bb:cc:dd:ee:02".to_string(),
+                    ip_address: Ipv4Addr::new(192, 168, 1, 50),
+                    hostname: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            duplicate_ip.validate().is_err(),
+            "Duplicate IP addresses should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_single_static_binding_valid() {
+        let single_binding = Config {
+            static_bindings: vec![StaticBinding {
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                ip_address: Ipv4Addr::new(192, 168, 1, 50),
+                hostname: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            single_binding.validate().is_ok(),
+            "Single static binding should be valid"
+        );
+    }
+
+    #[test]
+    fn test_multiple_unique_static_bindings_valid() {
+        let multiple_bindings = Config {
+            static_bindings: vec![
+                StaticBinding {
+                    mac_address: "aa:bb:cc:dd:ee:01".to_string(),
+                    ip_address: Ipv4Addr::new(192, 168, 1, 50),
+                    hostname: None,
+                },
+                StaticBinding {
+                    mac_address: "aa:bb:cc:dd:ee:02".to_string(),
+                    ip_address: Ipv4Addr::new(192, 168, 1, 51),
+                    hostname: None,
+                },
+                StaticBinding {
+                    mac_address: "aa:bb:cc:dd:ee:03".to_string(),
+                    ip_address: Ipv4Addr::new(192, 168, 1, 52),
+                    hostname: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            multiple_bindings.validate().is_ok(),
+            "Multiple unique static bindings should be valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_save_and_load() {
+        let path = "test_config_save_load.toml";
+        let _guard = TestGuard(path.to_string());
+
+        let config = Config {
+            server_ip: Ipv4Addr::new(10, 0, 0, 1),
+            subnet_mask: Ipv4Addr::new(255, 255, 0, 0),
+            pool_start: Ipv4Addr::new(10, 0, 1, 1),
+            pool_end: Ipv4Addr::new(10, 0, 1, 100),
+            gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
+            domain_name: Some("test.local".to_string()),
+            lease_duration_seconds: 7200,
+            renewal_time_seconds: Some(3600),
+            rebinding_time_seconds: Some(6300),
+            broadcast_address: None,
+            mtu: Some(1400),
+            static_bindings: vec![StaticBinding {
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                ip_address: Ipv4Addr::new(10, 0, 0, 100),
+                hostname: Some("static-host".to_string()),
+            }],
+            leases_file: "leases.json".to_string(),
+            interface_index: Some(1),
+        };
+
+        config.save(path).await.unwrap();
+
+        assert!(
+            std::path::Path::new(path).exists(),
+            "Config file should be created"
+        );
+
+        let loaded = Config::load_or_create(path).await.unwrap();
+
+        assert_eq!(loaded.server_ip, config.server_ip);
+        assert_eq!(loaded.subnet_mask, config.subnet_mask);
+        assert_eq!(loaded.pool_start, config.pool_start);
+        assert_eq!(loaded.pool_end, config.pool_end);
+        assert_eq!(loaded.gateway, config.gateway);
+        assert_eq!(loaded.dns_servers, config.dns_servers);
+        assert_eq!(loaded.domain_name, config.domain_name);
+        assert_eq!(loaded.lease_duration_seconds, config.lease_duration_seconds);
+        assert_eq!(loaded.static_bindings.len(), 1);
+        assert_eq!(loaded.static_bindings[0].mac_address, "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[tokio::test]
+    async fn test_config_load_creates_default_when_missing() {
+        let path = "test_config_nonexistent_12345.toml";
+        let _ = std::fs::remove_file(path);
+
+        let result = Config::load_or_create(path).await;
+
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.server_ip, Ipv4Addr::new(192, 168, 1, 1));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    struct TestGuard(String);
+    impl Drop for TestGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 }

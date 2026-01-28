@@ -36,3 +36,4 @@ windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+proptest = "1.5"

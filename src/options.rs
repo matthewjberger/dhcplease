@@ -574,57 +574,26 @@ mod tests {
     }
 
     #[test]
-    fn test_option_code() {
-        assert_eq!(
-            DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)).option_code(),
-            1
-        );
-        assert_eq!(
-            DhcpOption::Router(vec![Ipv4Addr::new(192, 168, 1, 1)]).option_code(),
-            3
-        );
-        assert_eq!(
-            DhcpOption::DnsServer(vec![Ipv4Addr::new(8, 8, 8, 8)]).option_code(),
-            6
-        );
-        assert_eq!(DhcpOption::Hostname("test".to_string()).option_code(), 12);
-        assert_eq!(
-            DhcpOption::DomainName("local".to_string()).option_code(),
-            15
-        );
-        assert_eq!(DhcpOption::InterfaceMtu(1500).option_code(), 26);
-        assert_eq!(
-            DhcpOption::BroadcastAddress(Ipv4Addr::new(192, 168, 1, 255)).option_code(),
-            28
-        );
-        assert_eq!(
-            DhcpOption::RequestedIpAddress(Ipv4Addr::new(192, 168, 1, 100)).option_code(),
-            50
-        );
-        assert_eq!(DhcpOption::LeaseTime(86400).option_code(), 51);
-        assert_eq!(
-            DhcpOption::OptionOverload(OverloadFlag::File).option_code(),
-            52
-        );
-        assert_eq!(
-            DhcpOption::MessageType(MessageType::Discover).option_code(),
-            53
-        );
-        assert_eq!(
-            DhcpOption::ServerIdentifier(Ipv4Addr::new(192, 168, 1, 1)).option_code(),
-            54
-        );
-        assert_eq!(
-            DhcpOption::ParameterRequestList(vec![1, 3, 6]).option_code(),
-            55
-        );
-        assert_eq!(DhcpOption::RenewalTime(43200).option_code(), 58);
-        assert_eq!(DhcpOption::RebindingTime(75600).option_code(), 59);
-        assert_eq!(
-            DhcpOption::ClientIdentifier(vec![1, 2, 3]).option_code(),
-            61
-        );
-        assert_eq!(DhcpOption::RelayAgentInfo(vec![1, 2, 3]).option_code(), 82);
-        assert_eq!(DhcpOption::Unknown(100, vec![1, 2, 3]).option_code(), 100);
+    fn test_dns_server_empty_data_rejected() {
+        let result = DhcpOption::parse(OptionCode::DnsServer as u8, &[]);
+        assert!(result.is_err(), "Empty DNS server list should be rejected");
+    }
+
+    #[test]
+    fn test_router_empty_data_rejected() {
+        let result = DhcpOption::parse(OptionCode::Router as u8, &[]);
+        assert!(result.is_err(), "Empty router list should be rejected");
+    }
+
+    #[test]
+    fn test_message_type_display() {
+        assert_eq!(format!("{}", MessageType::Discover), "DISCOVER");
+        assert_eq!(format!("{}", MessageType::Offer), "OFFER");
+        assert_eq!(format!("{}", MessageType::Request), "REQUEST");
+        assert_eq!(format!("{}", MessageType::Decline), "DECLINE");
+        assert_eq!(format!("{}", MessageType::Ack), "ACK");
+        assert_eq!(format!("{}", MessageType::Nak), "NAK");
+        assert_eq!(format!("{}", MessageType::Release), "RELEASE");
+        assert_eq!(format!("{}", MessageType::Inform), "INFORM");
     }
 }

@@ -428,7 +428,11 @@ impl PacketHandler {
 
         let hostname = packet.hostname().map(sanitize_hostname);
         let lease = if is_renewal {
-            match self.leases.renew_lease(&client_id, Some(lease_duration)).await {
+            match self
+                .leases
+                .renew_lease(&client_id, Some(lease_duration))
+                .await
+            {
                 Ok(lease) => lease,
                 Err(Error::LeaseNotFound(_)) => {
                     match self
@@ -729,15 +733,6 @@ mod tests {
 
     const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 
-    #[test]
-    fn test_constants() {
-        assert_eq!(DHCP_SERVER_PORT, 67);
-        assert_eq!(DHCP_CLIENT_PORT, 68);
-        assert_eq!(RECV_BUFFER_SIZE, 1500);
-        assert_eq!(RATE_LIMIT_MAX_REQUESTS, 10);
-        assert_eq!(RATE_LIMIT_WINDOW_SECS, 1);
-    }
-
     fn test_config() -> Config {
         Config {
             server_ip: Ipv4Addr::new(192, 168, 1, 1),
@@ -865,31 +860,6 @@ mod tests {
 
     fn is_network_error(err: &Error) -> bool {
         matches!(err, Error::Io(_))
-    }
-
-    #[test]
-    fn test_renewal_time_calculations() {
-        let config_default = Config {
-            lease_duration_seconds: 3600,
-            renewal_time_seconds: None,
-            rebinding_time_seconds: None,
-            ..test_config()
-        };
-
-        let expected_renewal = config_default.lease_duration_seconds / 2;
-        let expected_rebinding = (config_default.lease_duration_seconds * 7) / 8;
-
-        assert_eq!(expected_renewal, 1800);
-        assert_eq!(expected_rebinding, 3150);
-
-        let config_explicit = Config {
-            renewal_time_seconds: Some(1000),
-            rebinding_time_seconds: Some(2000),
-            ..test_config()
-        };
-
-        assert_eq!(config_explicit.renewal_time_seconds, Some(1000));
-        assert_eq!(config_explicit.rebinding_time_seconds, Some(2000));
     }
 
     #[tokio::test]
@@ -1626,5 +1596,283 @@ mod tests {
 
         let result = handler.handle_discover(&packet).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_packet_dispatches_to_discover() {
+        let (handler, _guard, _socket) = create_test_handler("dispatch_discover").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x20];
+        let packet_data = create_dhcp_packet(MessageType::Discover, mac, 0x12345678, vec![]);
+        let source: SocketAddr = "127.0.0.1:68".parse().unwrap();
+
+        let _ = handler.handle_packet(&packet_data, source).await;
+
+        let client_id = vec![HTYPE_ETHERNET, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x20];
+        let allocated = handler.leases.allocate_ip(&client_id).await.unwrap();
+        assert!(handler.config.ip_in_pool(allocated));
+    }
+
+    #[tokio::test]
+    async fn test_handle_packet_dispatches_to_request() {
+        let (handler, _guard, _socket) = create_test_handler("dispatch_request").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x21];
+        let client_id = vec![HTYPE_ETHERNET, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x21];
+
+        let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+
+        let packet_data = create_dhcp_packet(
+            MessageType::Request,
+            mac,
+            0x12345678,
+            vec![
+                DhcpOption::RequestedIpAddress(ip),
+                DhcpOption::ServerIdentifier(handler.config.server_ip),
+            ],
+        );
+        let source: SocketAddr = "127.0.0.1:68".parse().unwrap();
+
+        let _ = handler.handle_packet(&packet_data, source).await;
+
+        let lease = handler.leases.get_lease(&client_id).await;
+        assert!(
+            lease.is_some(),
+            "REQUEST handler was not dispatched - no lease created"
+        );
+        assert_eq!(lease.unwrap().ip_address, ip);
+    }
+
+    #[tokio::test]
+    async fn test_handle_packet_dispatches_to_release() {
+        let (handler, _guard, _socket) = create_test_handler("dispatch_release").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x22];
+        let client_id = vec![HTYPE_ETHERNET, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x22];
+
+        let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+        handler
+            .leases
+            .create_lease(&client_id, ip, None, None)
+            .await
+            .unwrap();
+
+        assert!(handler.leases.get_lease(&client_id).await.is_some());
+
+        let packet_data = create_packet_with_ciaddr(
+            MessageType::Release,
+            mac,
+            0x12345678,
+            ip,
+            vec![DhcpOption::ServerIdentifier(handler.config.server_ip)],
+        );
+        let source: SocketAddr = "127.0.0.1:68".parse().unwrap();
+
+        let _ = handler.handle_packet(&packet_data, source).await;
+
+        let lease = handler.leases.get_lease(&client_id).await;
+        assert!(
+            lease.is_none(),
+            "RELEASE handler was not dispatched - lease still exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_packet_dispatches_to_decline() {
+        let (handler, _guard, _socket) = create_test_handler("dispatch_decline").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x23];
+        let client_id = vec![HTYPE_ETHERNET, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x23];
+
+        let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+        handler
+            .leases
+            .create_lease(&client_id, ip, None, None)
+            .await
+            .unwrap();
+
+        assert!(handler.leases.is_ip_available(ip, &client_id).await);
+
+        let packet_data = create_dhcp_packet(
+            MessageType::Decline,
+            mac,
+            0x12345678,
+            vec![DhcpOption::RequestedIpAddress(ip)],
+        );
+        let source: SocketAddr = "127.0.0.1:68".parse().unwrap();
+
+        let _ = handler.handle_packet(&packet_data, source).await;
+
+        assert!(
+            !handler.leases.is_ip_available(ip, &client_id).await,
+            "DECLINE handler was not dispatched - IP still available"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_packet_dispatches_to_inform() {
+        let (handler, _guard, _socket) = create_test_handler("dispatch_inform").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x24];
+        let ciaddr = Ipv4Addr::new(192, 168, 1, 50);
+
+        let packet_data =
+            create_packet_with_ciaddr(MessageType::Inform, mac, 0x12345678, ciaddr, vec![]);
+        let source: SocketAddr = "127.0.0.1:68".parse().unwrap();
+
+        let result = handler.handle_packet(&packet_data, source).await;
+        assert!(
+            result.is_ok() || result.as_ref().err().map(is_network_error).unwrap_or(false),
+            "INFORM handler was not dispatched"
+        );
+
+        let client_id = vec![HTYPE_ETHERNET, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x24];
+        assert!(
+            handler.leases.get_lease(&client_id).await.is_none(),
+            "INFORM should not create a lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_negotiate_lease_time_uses_requested() {
+        let (handler, _guard, _socket) = create_test_handler("negotiate_lease").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x25];
+        let client_id = vec![HTYPE_ETHERNET, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x25];
+
+        let ip = handler.leases.allocate_ip(&client_id).await.unwrap();
+
+        let requested_time = 1800u32;
+        let packet_data = create_dhcp_packet(
+            MessageType::Request,
+            mac,
+            0x12345678,
+            vec![
+                DhcpOption::RequestedIpAddress(ip),
+                DhcpOption::ServerIdentifier(handler.config.server_ip),
+                DhcpOption::LeaseTime(requested_time),
+            ],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        assert_eq!(packet.requested_lease_time(), Some(requested_time));
+
+        let negotiated = handler.negotiate_lease_time(&packet);
+        assert_eq!(negotiated, requested_time);
+    }
+
+    #[tokio::test]
+    async fn test_negotiate_lease_time_clamps_minimum() {
+        let (handler, _guard, _socket) = create_test_handler("negotiate_min").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x26];
+        let packet_data = create_dhcp_packet(
+            MessageType::Request,
+            mac,
+            0x12345678,
+            vec![DhcpOption::LeaseTime(10)],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let negotiated = handler.negotiate_lease_time(&packet);
+        assert_eq!(
+            negotiated, 60,
+            "Lease time should be clamped to minimum 60 seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_negotiate_lease_time_clamps_maximum() {
+        let (handler, _guard, _socket) = create_test_handler("negotiate_max").await;
+
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x27];
+        let packet_data = create_dhcp_packet(
+            MessageType::Request,
+            mac,
+            0x12345678,
+            vec![DhcpOption::LeaseTime(999999)],
+        );
+        let packet = DhcpPacket::parse(&packet_data).unwrap();
+
+        let negotiated = handler.negotiate_lease_time(&packet);
+        assert_eq!(
+            negotiated, handler.config.lease_duration_seconds,
+            "Lease time should be clamped to configured maximum"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_offer_options_renewal_time_calculation() {
+        let path = "test_server_renewal_calc.json".to_string();
+        let _guard = TestGuard(path.clone());
+
+        let config = Config {
+            lease_duration_seconds: 7200,
+            renewal_time_seconds: None,
+            rebinding_time_seconds: None,
+            leases_file: path,
+            ..test_config()
+        };
+
+        let config = Arc::new(config);
+        let leases = Arc::new(Leases::new(Arc::clone(&config)).await.unwrap());
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let handler = PacketHandler {
+            config,
+            leases,
+            socket,
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let options = handler.build_offer_options();
+
+        let renewal_time = options.iter().find_map(|opt| {
+            if let DhcpOption::RenewalTime(t) = opt {
+                Some(*t)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            renewal_time,
+            Some(3600),
+            "Renewal time should be lease_duration / 2"
+        );
+
+        let rebinding_time = options.iter().find_map(|opt| {
+            if let DhcpOption::RebindingTime(t) = opt {
+                Some(*t)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            rebinding_time,
+            Some(6300),
+            "Rebinding time should be lease_duration * 7 / 8"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_rate_limited_boundary() {
+        let (handler, _guard, _socket) = create_test_handler("rate_boundary").await;
+
+        let mac: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x28];
+
+        for index in 0..RATE_LIMIT_MAX_REQUESTS {
+            let result = handler.is_rate_limited(mac).await;
+            assert!(!result, "Request {} should not be rate limited", index);
+        }
+
+        assert!(
+            handler.is_rate_limited(mac).await,
+            "Request at exactly MAX_REQUESTS should be rate limited"
+        );
+
+        assert!(
+            handler.is_rate_limited(mac).await,
+            "Request beyond MAX_REQUESTS should be rate limited"
+        );
     }
 }

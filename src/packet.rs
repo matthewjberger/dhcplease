@@ -952,4 +952,241 @@ mod tests {
                 .any(|opt| matches!(opt, DhcpOption::Router(_)))
         );
     }
+
+    #[test]
+    fn test_minimum_valid_packet() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.op, BOOTREQUEST);
+        assert!(parsed.options.is_empty());
+    }
+
+    #[test]
+    fn test_packet_with_only_end_option() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE + 1];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet[240] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert!(parsed.options.is_empty());
+    }
+
+    #[test]
+    fn test_packet_with_pad_options() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE + 15];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet[240..248].fill(OptionCode::Pad as u8);
+        packet[248] = OptionCode::MessageType as u8;
+        packet[249] = 1;
+        packet[250] = MessageType::Discover as u8;
+        packet[251] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.message_type(), Some(MessageType::Discover));
+    }
+
+    #[test]
+    fn test_option_with_zero_length() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE + 10];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet[240] = OptionCode::ParameterRequestList as u8;
+        packet[241] = 0;
+        packet[242] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        let prl = parsed.parameter_request_list();
+        assert_eq!(prl, Some(&[][..]));
+    }
+
+    #[test]
+    fn test_option_with_max_length() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE + 260];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet[240] = OptionCode::ParameterRequestList as u8;
+        packet[241] = 255;
+        for index in 0..255 {
+            packet[242 + index] = index as u8;
+        }
+        packet[497] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        let prl = parsed.parameter_request_list().unwrap();
+        assert_eq!(prl.len(), 255);
+    }
+
+    #[test]
+    fn test_hostname_max_length_truncation() {
+        let long_hostname = "a".repeat(300);
+        let option = DhcpOption::Hostname(long_hostname);
+        let encoded = option.encode();
+        assert_eq!(encoded[1], 255);
+        assert_eq!(encoded.len(), 257);
+    }
+
+    #[test]
+    fn test_duplicate_message_type_options() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE + 10];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet[240] = OptionCode::MessageType as u8;
+        packet[241] = 1;
+        packet[242] = MessageType::Discover as u8;
+        packet[243] = OptionCode::MessageType as u8;
+        packet[244] = 1;
+        packet[245] = MessageType::Request as u8;
+        packet[246] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.message_type(), Some(MessageType::Discover));
+        assert_eq!(parsed.options.len(), 2);
+    }
+
+    #[test]
+    fn test_truncated_option_length() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE + 2];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet[240] = OptionCode::LeaseTime as u8;
+
+        let result = DhcpPacket::parse(&packet);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_truncated_option_data() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE + 4];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet[240] = OptionCode::LeaseTime as u8;
+        packet[241] = 4;
+        packet[242] = 0;
+        packet[243] = 0;
+
+        let result = DhcpPacket::parse(&packet);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unknown_option_preserved() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE + 10];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet[240] = 200;
+        packet[241] = 4;
+        packet[242..246].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        packet[246] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert!(parsed.options.iter().any(
+            |opt| matches!(opt, DhcpOption::Unknown(200, data) if data == &[0xDE, 0xAD, 0xBE, 0xEF])
+        ));
+    }
+
+    #[test]
+    fn test_all_zero_chaddr() {
+        let mut packet = create_test_packet(MessageType::Discover, false);
+        packet[28..44].copy_from_slice(&[0u8; 16]);
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.format_mac(), "00:00:00:00:00:00");
+    }
+
+    #[test]
+    fn test_packet_field_offsets_correct() {
+        let mut packet = vec![0u8; DHCP_FIXED_HEADER_SIZE + 5];
+        packet[0] = BOOTREQUEST;
+        packet[1] = HTYPE_ETHERNET;
+        packet[2] = HLEN_ETHERNET;
+        packet[3] = 5;
+        packet[4..8].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+        packet[8..10].copy_from_slice(&1234u16.to_be_bytes());
+        packet[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
+        packet[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        packet[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        packet[20..24].copy_from_slice(&[10, 0, 0, 3]);
+        packet[24..28].copy_from_slice(&[10, 0, 0, 4]);
+        packet[28..34].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        packet[44..52].copy_from_slice(b"testname");
+        packet[108..116].copy_from_slice(b"bootfile");
+        packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet[240] = OptionCode::End as u8;
+
+        let parsed = DhcpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.op, BOOTREQUEST);
+        assert_eq!(parsed.htype, HTYPE_ETHERNET);
+        assert_eq!(parsed.hlen, HLEN_ETHERNET);
+        assert_eq!(parsed.hops, 5);
+        assert_eq!(parsed.xid, 0xDEADBEEF);
+        assert_eq!(parsed.secs, 1234);
+        assert_eq!(parsed.flags, 0x8000);
+        assert_eq!(parsed.ciaddr, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(parsed.yiaddr, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(parsed.siaddr, Ipv4Addr::new(10, 0, 0, 3));
+        assert_eq!(parsed.giaddr, Ipv4Addr::new(10, 0, 0, 4));
+        assert_eq!(&parsed.chaddr[..6], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    }
+
+    #[test]
+    fn test_encode_produces_correct_offsets() {
+        let packet = DhcpPacket {
+            op: BOOTREPLY,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            hops: 3,
+            xid: 0x12345678,
+            secs: 999,
+            flags: 0x8000,
+            ciaddr: Ipv4Addr::new(192, 168, 1, 10),
+            yiaddr: Ipv4Addr::new(192, 168, 1, 20),
+            siaddr: Ipv4Addr::new(192, 168, 1, 1),
+            giaddr: Ipv4Addr::new(192, 168, 2, 1),
+            chaddr: [
+                0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            sname: [0u8; 64],
+            file: [0u8; 128],
+            options: vec![DhcpOption::MessageType(MessageType::Offer)],
+        };
+
+        let encoded = packet.encode();
+
+        assert_eq!(encoded[0], BOOTREPLY);
+        assert_eq!(encoded[1], HTYPE_ETHERNET);
+        assert_eq!(encoded[2], HLEN_ETHERNET);
+        assert_eq!(encoded[3], 3);
+        assert_eq!(&encoded[4..8], &0x12345678u32.to_be_bytes());
+        assert_eq!(&encoded[8..10], &999u16.to_be_bytes());
+        assert_eq!(&encoded[10..12], &0x8000u16.to_be_bytes());
+        assert_eq!(&encoded[12..16], &[192, 168, 1, 10]);
+        assert_eq!(&encoded[16..20], &[192, 168, 1, 20]);
+        assert_eq!(&encoded[20..24], &[192, 168, 1, 1]);
+        assert_eq!(&encoded[24..28], &[192, 168, 2, 1]);
+        assert_eq!(&encoded[28..34], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(&encoded[236..240], &DHCP_MAGIC_COOKIE);
+    }
 }
