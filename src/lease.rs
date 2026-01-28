@@ -1,3 +1,21 @@
+//! DHCP lease management and persistence.
+//!
+//! This module handles IP address allocation, lease tracking, and persistence.
+//! It implements the server-side lease state machine including:
+//!
+//! - IP allocation from the dynamic pool
+//! - Static MAC-to-IP bindings
+//! - Pending offer tracking (pre-lease reservations)
+//! - Lease creation, renewal, and release
+//! - Declined IP tracking
+//! - Persistence to JSON files
+//!
+//! # Thread Safety
+//!
+//! All operations are thread-safe. The [`Leases`] struct uses:
+//! - [`RwLock`] for the main state (allows concurrent reads)
+//! - [`Mutex`] for file save operations (prevents corruption)
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -11,10 +29,25 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::Config;
 use crate::error::{Error, Result};
 
+/// How long declined IPs remain unavailable (1 hour).
+///
+/// When a client sends DECLINE (indicating IP conflict), the IP is removed
+/// from the pool for this duration to avoid repeatedly offering conflicting IPs.
 const DECLINE_EXPIRATION_SECONDS: i64 = 3600;
+
+/// How long a pending offer reserves an IP (60 seconds).
+///
+/// After DISCOVER, the server reserves an IP for this duration waiting for
+/// the client's REQUEST. If no REQUEST arrives, the IP returns to the pool.
 const OFFER_TIMEOUT_SECONDS: u64 = 60;
+
+/// Minimum interval between lease file saves (5 seconds).
+///
+/// Prevents excessive disk I/O when handling many requests. The dirty flag
+/// is checked and cleared on each save.
 const SAVE_INTERVAL_MILLIS: u64 = 5000;
 
+/// Encodes a client ID as a colon-separated hex string for storage.
 fn encode_client_id(client_id: &[u8]) -> String {
     client_id
         .iter()
@@ -23,17 +56,39 @@ fn encode_client_id(client_id: &[u8]) -> String {
         .join(":")
 }
 
+/// An active DHCP lease.
+///
+/// Represents a binding between a client identifier and an IP address
+/// with an expiration time. Leases are persisted to disk and restored
+/// on server restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lease {
+    /// The IP address assigned to this client.
     pub ip_address: Ipv4Addr,
+
+    /// Unique client identifier (hex-encoded).
+    ///
+    /// Derived from DHCP Option 61 if present, otherwise from
+    /// hardware type + hardware address.
     pub client_id: String,
+
+    /// Client-provided hostname (Option 12), sanitized.
     pub hostname: Option<String>,
+
+    /// When this lease expires (UTC).
     pub expires_at: DateTime<Utc>,
+
+    /// When this lease was originally created (UTC).
     pub created_at: DateTime<Utc>,
+
+    /// When the client last renewed or used this lease (UTC).
     pub last_seen: DateTime<Utc>,
 }
 
 impl Lease {
+    /// Creates a new lease with the specified duration.
+    ///
+    /// Sets `created_at`, `last_seen`, and `expires_at` based on current time.
     pub fn new(ip_address: Ipv4Addr, client_id: String, duration_seconds: u32) -> Self {
         let now = Utc::now();
         Self {
@@ -46,57 +101,104 @@ impl Lease {
         }
     }
 
+    /// Returns true if the lease has expired.
     pub fn is_expired(&self) -> bool {
         Utc::now() > self.expires_at
     }
 
+    /// Renews the lease for the specified duration from now.
+    ///
+    /// Updates `expires_at` and `last_seen` to current time.
     pub fn renew(&mut self, duration_seconds: u32) {
         let now = Utc::now();
         self.expires_at = now + TimeDelta::seconds(duration_seconds as i64);
         self.last_seen = now;
     }
 
+    /// Returns seconds remaining until expiration, or 0 if expired.
     pub fn remaining_seconds(&self) -> i64 {
         let remaining = self.expires_at - Utc::now();
         remaining.num_seconds().max(0)
     }
 }
 
+/// A pending IP offer awaiting client REQUEST.
 #[derive(Debug, Clone)]
 struct PendingOffer {
     ip: Ipv4Addr,
     expires_at: Instant,
 }
 
+/// Persistent lease storage format (serialized to JSON).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LeaseStore {
+    /// Active leases indexed by client ID.
     pub leases: HashMap<String, Lease>,
+    /// Reverse lookup: IP address → client ID.
     pub ip_to_client: HashMap<Ipv4Addr, String>,
+    /// IPs that were declined, with timestamp of decline.
     #[serde(default)]
     pub declined_ips: HashMap<Ipv4Addr, DateTime<Utc>>,
 }
 
+/// Internal mutable state protected by RwLock.
 #[derive(Debug)]
 struct InternalState {
     store: LeaseStore,
+    /// Available IPs in the pool (sorted for deterministic allocation).
     free_ips: BTreeSet<Ipv4Addr>,
+    /// Pending offers by client ID (not yet committed leases).
     pending_offers: HashMap<String, PendingOffer>,
+    /// IPs currently in pending offers (for quick lookup).
     pending_ips: HashSet<Ipv4Addr>,
+    /// Whether state has changed since last save.
     dirty: bool,
+    /// When state was last saved to disk.
     last_save: Instant,
 }
 
+/// Thread-safe lease manager with persistence.
+///
+/// Handles all lease operations including allocation, creation, renewal,
+/// release, and decline. State is automatically persisted to a JSON file.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use dhcplease::{Config, Leases};
+///
+/// # async fn example() -> dhcplease::Result<()> {
+/// let config = Arc::new(Config::default());
+/// let leases = Leases::new(config).await?;
+///
+/// let client_id = vec![1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+/// let ip = leases.allocate_ip(&client_id).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Leases {
     state: Arc<RwLock<InternalState>>,
     config: Arc<Config>,
     leases_path: String,
+    /// Static bindings: normalized client ID → IP.
     static_mac_to_ip: HashMap<String, Ipv4Addr>,
+    /// Static bindings: IP → normalized client ID.
     static_ip_to_mac: HashMap<Ipv4Addr, String>,
+    /// Mutex to prevent concurrent file writes.
     save_lock: Arc<Mutex<()>>,
 }
 
 impl Leases {
+    /// Creates a new lease manager from the given configuration.
+    ///
+    /// Loads existing leases from the configured `leases_file` if it exists.
+    /// Initializes the free IP pool by excluding leased and static-bound IPs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lease file exists but cannot be read or parsed.
     pub async fn new(config: Arc<Config>) -> Result<Self> {
         let leases_path = config.leases_file.clone();
         let store = Self::load_store(&leases_path).await?;
@@ -168,12 +270,14 @@ impl Leases {
         }
     }
 
+    /// Returns the lease for a client, if one exists.
     pub async fn get_lease(&self, client_id: &[u8]) -> Option<Lease> {
         let key = encode_client_id(client_id);
         let state = self.state.read().await;
         state.store.leases.get(&key).cloned()
     }
 
+    /// Returns the lease for an IP address, if one exists.
     pub async fn get_lease_by_ip(&self, ip: Ipv4Addr) -> Option<Lease> {
         let state = self.state.read().await;
         state
@@ -183,6 +287,20 @@ impl Leases {
             .and_then(|client| state.store.leases.get(client).cloned())
     }
 
+    /// Allocates an IP address for a client (DISCOVER handling).
+    ///
+    /// # Allocation Priority
+    ///
+    /// 1. Static binding for this client's MAC
+    /// 2. Existing non-expired lease for this client
+    /// 3. Existing pending offer for this client
+    /// 4. First available IP from the free pool
+    ///
+    /// The returned IP is tracked as a pending offer for 60 seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PoolExhausted`] if no IPs are available.
     pub async fn allocate_ip(&self, client_id: &[u8]) -> Result<Ipv4Addr> {
         let key = encode_client_id(client_id);
 
@@ -262,6 +380,9 @@ impl Leases {
             .retain(|_, offer| offer.expires_at > now);
     }
 
+    /// Tracks a pending offer for a client (used when client requests specific IP).
+    ///
+    /// Replaces any existing pending offer for this client.
     pub async fn track_pending_offer(&self, client_id: &[u8], ip: Ipv4Addr) {
         let key = encode_client_id(client_id);
         let mut state = self.state.write().await;
@@ -279,6 +400,27 @@ impl Leases {
         state.pending_ips.insert(ip);
     }
 
+    /// Creates or updates a lease (REQUEST/ACK handling).
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - Unique client identifier
+    /// * `ip_address` - IP address to lease
+    /// * `hostname` - Optional client hostname
+    /// * `duration_seconds` - Lease duration (uses config default if None)
+    ///
+    /// # Behavior
+    ///
+    /// - Validates IP is in pool or is a static binding for this client
+    /// - Removes any pending offer for this client
+    /// - If client had a different IP, releases the old one
+    /// - Creates the lease and marks state dirty for persistence
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - IP is outside pool and not a static binding for this client
+    /// - IP is already leased to a different client
     pub async fn create_lease(
         &self,
         client_id: &[u8],
@@ -347,6 +489,13 @@ impl Leases {
         Ok(lease)
     }
 
+    /// Renews an existing lease.
+    ///
+    /// Updates the expiration time without changing the IP assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::LeaseNotFound`] if the client has no lease.
     pub async fn renew_lease(
         &self,
         client_id: &[u8],
@@ -371,6 +520,13 @@ impl Leases {
         Ok(lease)
     }
 
+    /// Releases a lease (RELEASE handling).
+    ///
+    /// The IP is returned to the free pool for reallocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ciaddr` doesn't match the client's leased IP.
     pub async fn release_lease(&self, client_id: &[u8], ciaddr: Ipv4Addr) -> Result<()> {
         let key = encode_client_id(client_id);
         let mut state = self.state.write().await;
@@ -398,6 +554,12 @@ impl Leases {
         Ok(())
     }
 
+    /// Checks if an IP is available for a specific client.
+    ///
+    /// An IP is available if:
+    /// - It's not declined (or decline has expired)
+    /// - It's not pending for a different client
+    /// - It's not leased to a different client (or is leased to this client)
     pub async fn is_ip_available(&self, ip: Ipv4Addr, client_id: &[u8]) -> bool {
         let key = encode_client_id(client_id);
         let mut state = self.state.write().await;
@@ -427,6 +589,15 @@ impl Leases {
         }
     }
 
+    /// Marks an IP as declined (DECLINE handling).
+    ///
+    /// The IP is removed from the pool for 1 hour to avoid repeatedly
+    /// offering an IP that may be in conflict.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the decline was accepted (IP was in pool or
+    /// leased to this client), `false` otherwise.
     pub async fn decline_ip(&self, ip: Ipv4Addr, client_id: &[u8]) -> Result<bool> {
         let key = encode_client_id(client_id);
         let mut state = self.state.write().await;
@@ -460,6 +631,9 @@ impl Leases {
         Ok(true)
     }
 
+    /// Removes all expired leases and returns their IPs to the pool.
+    ///
+    /// Returns the number of leases cleaned up.
     pub async fn cleanup_expired_leases(&self) -> Result<usize> {
         let mut state = self.state.write().await;
         let count = self.cleanup_expired_internal(&mut state);
@@ -511,6 +685,7 @@ impl Leases {
         Ok(())
     }
 
+    /// Forces an immediate save of the lease state to disk.
     pub async fn save(&self) -> Result<()> {
         let state = self.state.read().await;
         let store_clone = state.store.clone();
@@ -527,11 +702,13 @@ impl Leases {
         Ok(())
     }
 
+    /// Returns all leases (including expired ones).
     pub async fn list_leases(&self) -> Vec<Lease> {
         let state = self.state.read().await;
         state.store.leases.values().cloned().collect()
     }
 
+    /// Returns the count of non-expired leases.
     pub async fn active_lease_count(&self) -> usize {
         let state = self.state.read().await;
         state
@@ -542,11 +719,13 @@ impl Leases {
             .count()
     }
 
+    /// Returns the count of available IPs in the pool.
     pub async fn free_ip_count(&self) -> usize {
         let state = self.state.read().await;
         state.free_ips.len()
     }
 
+    /// Checks if a client has a static binding for the given IP.
     pub fn is_static_binding(&self, client_id: &[u8], ip: Ipv4Addr) -> bool {
         if let Some(static_key) = Self::client_id_to_static_key(client_id)
             && let Some(&bound_ip) = self.static_mac_to_ip.get(&static_key)

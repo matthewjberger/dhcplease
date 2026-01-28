@@ -1,3 +1,24 @@
+//! DHCP server configuration.
+//!
+//! The [`Config`] struct defines all server parameters including the IP pool,
+//! lease duration, network options, and static bindings. Configuration is
+//! loaded from and saved to JSON files.
+//!
+//! # Example Configuration
+//!
+//! ```json
+//! {
+//!   "server_ip": "192.168.1.1",
+//!   "subnet_mask": "255.255.255.0",
+//!   "pool_start": "192.168.1.100",
+//!   "pool_end": "192.168.1.200",
+//!   "gateway": "192.168.1.1",
+//!   "dns_servers": ["8.8.8.8"],
+//!   "lease_duration_seconds": 86400,
+//!   "leases_file": "leases.json"
+//! }
+//! ```
+
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -6,29 +27,99 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+/// DHCP server configuration.
+///
+/// All network-related options that clients receive (subnet mask, gateway, DNS)
+/// are configured here, along with the IP pool range and lease parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// IP address of this DHCP server.
+    ///
+    /// Sent to clients as the Server Identifier (Option 54). Must not be
+    /// within the pool range.
     pub server_ip: Ipv4Addr,
+
+    /// Subnet mask to provide to clients (Option 1).
+    ///
+    /// Must be a valid contiguous mask (e.g., 255.255.255.0).
     pub subnet_mask: Ipv4Addr,
+
+    /// First IP address in the dynamic allocation pool (inclusive).
     pub pool_start: Ipv4Addr,
+
+    /// Last IP address in the dynamic allocation pool (inclusive).
     pub pool_end: Ipv4Addr,
+
+    /// Default gateway to provide to clients (Option 3).
+    ///
+    /// Must not be within the pool range if set.
     pub gateway: Option<Ipv4Addr>,
+
+    /// DNS servers to provide to clients (Option 6).
     pub dns_servers: Vec<Ipv4Addr>,
+
+    /// Domain name to provide to clients (Option 15).
     pub domain_name: Option<String>,
+
+    /// Default lease duration in seconds (Option 51).
+    ///
+    /// Clients may request shorter leases, which will be honored down to
+    /// a minimum of 60 seconds.
     pub lease_duration_seconds: u32,
+
+    /// Renewal time T1 in seconds (Option 58).
+    ///
+    /// When clients should start attempting to renew their lease with
+    /// the original server. Defaults to 50% of lease_duration_seconds.
     pub renewal_time_seconds: Option<u32>,
+
+    /// Rebinding time T2 in seconds (Option 59).
+    ///
+    /// When clients should start broadcasting renewal requests to any
+    /// server. Defaults to 87.5% of lease_duration_seconds.
     pub rebinding_time_seconds: Option<u32>,
+
+    /// Broadcast address to provide to clients (Option 28).
+    ///
+    /// If not set, calculated from server_ip and subnet_mask.
     pub broadcast_address: Option<Ipv4Addr>,
+
+    /// Interface MTU to provide to clients (Option 26).
     pub mtu: Option<u16>,
+
+    /// Static MAC-to-IP bindings.
+    ///
+    /// These clients always receive the same IP address regardless of
+    /// the dynamic pool.
     pub static_bindings: Vec<StaticBinding>,
+
+    /// Path to the lease persistence file.
+    ///
+    /// Leases are saved to this JSON file and restored on server restart.
     pub leases_file: String,
+
+    /// Windows network interface index to bind to.
+    ///
+    /// Use `Get-NetAdapter | Format-Table InterfaceIndex` in PowerShell
+    /// to find interface indices. Only used on Windows; ignored on other platforms.
     pub interface_index: Option<u32>,
 }
 
+/// A static MAC-to-IP binding.
+///
+/// Clients with this MAC address always receive the specified IP address,
+/// bypassing the dynamic pool allocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticBinding {
+    /// MAC address in colon or hyphen-separated format (e.g., "aa:bb:cc:dd:ee:ff").
     pub mac_address: String,
+
+    /// IP address to always assign to this MAC.
+    ///
+    /// Does not need to be within the pool range.
     pub ip_address: Ipv4Addr,
+
+    /// Optional hostname to associate with this binding.
     pub hostname: Option<String>,
 }
 
@@ -55,6 +146,18 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Loads configuration from a file, or creates a default config if it doesn't exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the JSON configuration file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file exists but cannot be read or parsed
+    /// - The configuration fails validation
+    /// - A new default config cannot be written
     pub async fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
 
@@ -70,12 +173,32 @@ impl Config {
         }
     }
 
+    /// Saves the configuration to a JSON file.
+    ///
+    /// The file is written with pretty-printing for human readability.
     pub async fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let content = serde_json::to_string_pretty(self)?;
         tokio::fs::write(path, content).await?;
         Ok(())
     }
 
+    /// Validates the configuration for correctness.
+    ///
+    /// # Checks Performed
+    ///
+    /// - `pool_start` <= `pool_end`
+    /// - `server_ip` is not within the pool range
+    /// - `gateway` (if set) is not within the pool range
+    /// - `subnet_mask` is a valid contiguous mask
+    /// - Static bindings have valid MAC formats
+    /// - No duplicate MACs or IPs in static bindings
+    /// - `domain_name` contains only valid characters
+    /// - `lease_duration_seconds` > 0
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] with a description of the first
+    /// validation failure encountered.
     pub fn validate(&self) -> Result<()> {
         let start = u32::from(self.pool_start);
         let end = u32::from(self.pool_end);
@@ -164,6 +287,9 @@ impl Config {
         inverted.count_ones() == inverted.trailing_ones()
     }
 
+    /// Checks if an IP address is within the configured pool range.
+    ///
+    /// Returns `true` if `pool_start <= ip <= pool_end`.
     pub fn ip_in_pool(&self, ip: Ipv4Addr) -> bool {
         let addr = u32::from(ip);
         let start = u32::from(self.pool_start);
@@ -171,10 +297,15 @@ impl Config {
         addr >= start && addr <= end
     }
 
+    /// Returns the total number of addresses in the pool.
     pub fn pool_size(&self) -> u32 {
         u32::from(self.pool_end) - u32::from(self.pool_start) + 1
     }
 
+    /// Returns the broadcast address for the configured network.
+    ///
+    /// If `broadcast_address` is explicitly configured, returns that value.
+    /// Otherwise, calculates it from `server_ip` and `subnet_mask`.
     pub fn calculate_broadcast(&self) -> Ipv4Addr {
         if let Some(broadcast) = self.broadcast_address {
             return broadcast;
@@ -186,6 +317,10 @@ impl Config {
         Ipv4Addr::from(broadcast)
     }
 
+    /// Validates a MAC address string format.
+    ///
+    /// Accepts colon-separated (aa:bb:cc:dd:ee:ff) or hyphen-separated
+    /// (aa-bb-cc-dd-ee-ff) formats, case-insensitive.
     pub fn is_valid_mac(mac: &str) -> bool {
         let normalized = normalize_mac(mac);
         let parts: Vec<&str> = normalized.split(':').collect();
@@ -196,10 +331,17 @@ impl Config {
     }
 }
 
+/// Normalizes a MAC address to lowercase colon-separated format.
+///
+/// Converts "AA-BB-CC-DD-EE-FF" to "aa:bb:cc:dd:ee:ff".
 pub fn normalize_mac(mac: &str) -> String {
     mac.to_lowercase().replace('-', ":")
 }
 
+/// Sanitizes a hostname by removing invalid characters.
+///
+/// Keeps only ASCII alphanumeric characters, hyphens, and dots.
+/// Truncates to 255 characters maximum per RFC 1035.
 pub fn sanitize_hostname(hostname: &str) -> String {
     hostname
         .chars()
@@ -208,6 +350,10 @@ pub fn sanitize_hostname(hostname: &str) -> String {
         .collect()
 }
 
+/// Sanitizes a domain name by removing invalid characters.
+///
+/// Keeps only ASCII alphanumeric characters, hyphens, and dots.
+/// Truncates to 255 characters maximum per RFC 1035.
 pub fn sanitize_domain_name(domain: &str) -> String {
     domain
         .chars()

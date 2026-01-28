@@ -1,30 +1,70 @@
+//! DHCP options as defined in RFC 2132.
+//!
+//! DHCP uses options to convey configuration parameters between servers and clients.
+//! Each option has a code (1 byte), length (1 byte), and variable-length data.
+//!
+//! This module implements parsing and encoding for commonly used options.
+//! Unknown options are preserved as [`DhcpOption::Unknown`] for forwarding.
+//!
+//! # References
+//!
+//! - RFC 2132: DHCP Options and BOOTP Vendor Extensions
+//! - RFC 3046: DHCP Relay Agent Information Option (Option 82)
+
 use std::net::Ipv4Addr;
 
 use crate::error::{Error, Result};
 
+/// Maximum number of IP addresses in Router (3) or DNS Server (6) options.
+///
+/// Options have a 1-byte length field, so maximum data is 255 bytes.
+/// With 4 bytes per IPv4 address, that's 63 addresses maximum.
 const MAX_ADDRESSES_PER_OPTION: usize = 63;
 
+/// DHCP option codes as defined in RFC 2132.
+///
+/// Only codes used by this implementation are defined; unknown codes
+/// are handled via [`DhcpOption::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OptionCode {
+    /// Padding (no operation). Used for alignment.
     Pad = 0,
+    /// Subnet mask (RFC 2132 §3.3).
     SubnetMask = 1,
+    /// Router/gateway addresses (RFC 2132 §3.5).
     Router = 3,
+    /// DNS server addresses (RFC 2132 §3.8).
     DnsServer = 6,
+    /// Client hostname (RFC 2132 §3.14).
     Hostname = 12,
+    /// Domain name for DNS resolution (RFC 2132 §3.17).
     DomainName = 15,
+    /// Interface MTU (RFC 2132 §5.1).
     InterfaceMtu = 26,
+    /// Broadcast address (RFC 2132 §5.3).
     BroadcastAddress = 28,
+    /// Requested IP address (RFC 2132 §9.1).
     RequestedIpAddress = 50,
+    /// IP address lease time in seconds (RFC 2132 §9.2).
     LeaseTime = 51,
+    /// Option overload - indicates sname/file fields contain options (RFC 2132 §9.3).
     OptionOverload = 52,
+    /// DHCP message type (RFC 2132 §9.6).
     MessageType = 53,
+    /// Server identifier (RFC 2132 §9.7).
     ServerIdentifier = 54,
+    /// Parameter request list (RFC 2132 §9.8).
     ParameterRequestList = 55,
+    /// Renewal time T1 (RFC 2132 §9.11).
     RenewalTime = 58,
+    /// Rebinding time T2 (RFC 2132 §9.12).
     RebindingTime = 59,
+    /// Client identifier (RFC 2132 §9.14).
     ClientIdentifier = 61,
+    /// Relay agent information (RFC 3046).
     RelayAgentInfo = 82,
+    /// End of options marker.
     End = 255,
 }
 
@@ -57,16 +97,27 @@ impl TryFrom<u8> for OptionCode {
     }
 }
 
+/// DHCP message types (Option 53) as defined in RFC 2132 §9.6.
+///
+/// These values indicate the purpose of a DHCP message in the protocol exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
+    /// Client broadcast to locate servers.
     Discover = 1,
+    /// Server response to DISCOVER with IP offer.
     Offer = 2,
+    /// Client request for offered parameters.
     Request = 3,
+    /// Client indicates address is already in use.
     Decline = 4,
+    /// Server acknowledgement with configuration.
     Ack = 5,
+    /// Server negative acknowledgement.
     Nak = 6,
+    /// Client releases IP address.
     Release = 7,
+    /// Client requests config without IP allocation.
     Inform = 8,
 }
 
@@ -103,11 +154,18 @@ impl std::fmt::Display for MessageType {
     }
 }
 
+/// Option overload flags (Option 52) as defined in RFC 2132 §9.3.
+///
+/// Indicates that the `sname` and/or `file` fields in the DHCP packet
+/// header contain DHCP options instead of their normal content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OverloadFlag {
+    /// The `file` field contains options.
     File = 1,
+    /// The `sname` field contains options.
     Sname = 2,
+    /// Both `file` and `sname` fields contain options.
     Both = 3,
 }
 
@@ -124,29 +182,53 @@ impl TryFrom<u8> for OverloadFlag {
     }
 }
 
+/// A parsed DHCP option.
+///
+/// Each variant corresponds to a specific option code from RFC 2132.
+/// Unknown options are preserved as [`Unknown`](Self::Unknown) to allow
+/// forwarding in relay scenarios.
 #[derive(Debug, Clone)]
 pub enum DhcpOption {
+    /// Subnet mask (Option 1).
     SubnetMask(Ipv4Addr),
+    /// Router/gateway addresses (Option 3). First address is the default gateway.
     Router(Vec<Ipv4Addr>),
+    /// DNS server addresses (Option 6).
     DnsServer(Vec<Ipv4Addr>),
+    /// Client hostname (Option 12).
     Hostname(String),
+    /// Domain name for client DNS resolution (Option 15).
     DomainName(String),
+    /// Broadcast address (Option 28).
     BroadcastAddress(Ipv4Addr),
+    /// Client's requested IP address (Option 50).
     RequestedIpAddress(Ipv4Addr),
+    /// Lease time in seconds (Option 51).
     LeaseTime(u32),
+    /// Indicates sname/file fields contain options (Option 52).
     OptionOverload(OverloadFlag),
+    /// DHCP message type (Option 53).
     MessageType(MessageType),
+    /// Server identifier - IP of the DHCP server (Option 54).
     ServerIdentifier(Ipv4Addr),
+    /// List of option codes the client wants (Option 55).
     ParameterRequestList(Vec<u8>),
+    /// Renewal time T1 in seconds (Option 58).
     RenewalTime(u32),
+    /// Rebinding time T2 in seconds (Option 59).
     RebindingTime(u32),
+    /// Client identifier for unique identification (Option 61).
     ClientIdentifier(Vec<u8>),
+    /// Relay agent information (Option 82, RFC 3046).
     RelayAgentInfo(Vec<u8>),
+    /// Interface MTU (Option 26).
     InterfaceMtu(u16),
+    /// Unknown option with raw code and data, preserved for forwarding.
     Unknown(u8, Vec<u8>),
 }
 
 impl DhcpOption {
+    /// Returns the RFC 2132 option code for this option.
     pub fn option_code(&self) -> u8 {
         match self {
             Self::SubnetMask(_) => OptionCode::SubnetMask as u8,
@@ -170,6 +252,17 @@ impl DhcpOption {
         }
     }
 
+    /// Parses a DHCP option from its code and raw data.
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - The option code (first byte of TLV)
+    /// * `data` - The option data (after code and length bytes)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPacket`] if the data length is invalid for
+    /// the option type (e.g., subnet mask must be exactly 4 bytes).
     pub fn parse(code: u8, data: &[u8]) -> Result<Self> {
         match OptionCode::try_from(code) {
             Ok(OptionCode::SubnetMask) => {
@@ -310,6 +403,10 @@ impl DhcpOption {
         }
     }
 
+    /// Encodes the option to its wire format (code + length + data).
+    ///
+    /// The returned bytes can be directly appended to a DHCP packet's
+    /// options section.
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::SubnetMask(addr) => {

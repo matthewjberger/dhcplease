@@ -1,9 +1,53 @@
+//! DHCP packet parsing and encoding per RFC 2131.
+//!
+//! A DHCP packet consists of a fixed 236-byte header followed by a 4-byte
+//! magic cookie and variable-length options. This module handles parsing
+//! incoming packets and constructing replies.
+//!
+//! # Packet Structure
+//!
+//! ```text
+//! 0                   1                   2                   3
+//! 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |     op (1)    |   htype (1)   |   hlen (1)    |   hops (1)    |
+//! +---------------+---------------+---------------+---------------+
+//! |                            xid (4)                            |
+//! +-------------------------------+-------------------------------+
+//! |           secs (2)            |           flags (2)           |
+//! +-------------------------------+-------------------------------+
+//! |                          ciaddr (4)                           |
+//! +---------------------------------------------------------------+
+//! |                          yiaddr (4)                           |
+//! +---------------------------------------------------------------+
+//! |                          siaddr (4)                           |
+//! +---------------------------------------------------------------+
+//! |                          giaddr (4)                           |
+//! +---------------------------------------------------------------+
+//! |                          chaddr (16)                          |
+//! +---------------------------------------------------------------+
+//! |                          sname (64)                           |
+//! +---------------------------------------------------------------+
+//! |                          file (128)                           |
+//! +---------------------------------------------------------------+
+//! |                    magic cookie (4) = 99.130.83.99            |
+//! +---------------------------------------------------------------+
+//! |                          options (variable)                   |
+//! +---------------------------------------------------------------+
+//! ```
+//!
+//! # References
+//!
+//! - RFC 2131: Dynamic Host Configuration Protocol
+
 use std::net::Ipv4Addr;
 
 use crate::error::{Error, Result};
 use crate::options::{DhcpOption, MessageType, OptionCode, OverloadFlag};
 
+/// DHCP magic cookie that identifies DHCP packets (vs BOOTP).
 const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
+
 const DHCP_OP_HTYPE_HLEN_HOPS_SIZE: usize = 4;
 const DHCP_XID_SIZE: usize = 4;
 const DHCP_SECS_SIZE: usize = 2;
@@ -40,36 +84,106 @@ const DHCP_SNAME_OFFSET: usize = DHCP_OP_HTYPE_HLEN_HOPS_SIZE
 
 const DHCP_FILE_OFFSET: usize = DHCP_SNAME_OFFSET + DHCP_SNAME_SIZE;
 
+/// Size of the fixed header portion including magic cookie.
 const DHCP_FIXED_HEADER_SIZE: usize = DHCP_MAGIC_COOKIE_OFFSET + DHCP_MAGIC_COOKIE.len();
+
+/// Minimum DHCP packet size per RFC 2131 §2.
+///
+/// DHCP requires packets to be at least 300 bytes for compatibility
+/// with BOOTP relay agents.
 const DHCP_MIN_PACKET_SIZE: usize = 300;
+
+/// Initial capacity for packet encoding buffer.
+///
+/// 576 bytes is the minimum MTU that all hosts must accept per RFC 791.
 const DHCP_ENCODE_CAPACITY: usize = 576;
+
+/// Maximum hop count before dropping the packet.
+///
+/// Prevents infinite relay loops. Per RFC 2131 §4.1, relay agents
+/// increment hops and should discard packets with excessive counts.
 const MAX_HOPS: u8 = 16;
 
+/// BOOTP/DHCP operation code for client requests.
 pub const BOOTREQUEST: u8 = 1;
+
+/// BOOTP/DHCP operation code for server replies.
 pub const BOOTREPLY: u8 = 2;
+
+/// Hardware type for Ethernet (most common).
 pub const HTYPE_ETHERNET: u8 = 1;
+
+/// Hardware address length for Ethernet (6 bytes).
 pub const HLEN_ETHERNET: u8 = 6;
 
+/// A parsed DHCP packet.
+///
+/// This struct represents both client requests and server replies.
+/// Use [`parse`](Self::parse) to parse incoming packets and
+/// [`create_reply`](Self::create_reply) to construct responses.
 #[derive(Debug, Clone)]
 pub struct DhcpPacket {
+    /// Operation code: [`BOOTREQUEST`] (1) or [`BOOTREPLY`] (2).
     pub op: u8,
+
+    /// Hardware address type. [`HTYPE_ETHERNET`] (1) for Ethernet.
     pub htype: u8,
+
+    /// Hardware address length. [`HLEN_ETHERNET`] (6) for Ethernet.
     pub hlen: u8,
+
+    /// Hop count, incremented by relay agents.
     pub hops: u8,
+
+    /// Transaction ID chosen by client, echoed in replies.
     pub xid: u32,
+
+    /// Seconds elapsed since client began address acquisition.
     pub secs: u16,
+
+    /// Flags. Bit 15 (0x8000) = broadcast flag.
     pub flags: u16,
+
+    /// Client IP address (set by client in RENEWING/REBINDING states).
     pub ciaddr: Ipv4Addr,
+
+    /// "Your" IP address - the address being assigned to the client.
     pub yiaddr: Ipv4Addr,
+
+    /// Server IP address (next server in BOOTP, or DHCP server).
     pub siaddr: Ipv4Addr,
+
+    /// Gateway IP address - set by relay agents.
     pub giaddr: Ipv4Addr,
+
+    /// Client hardware address (MAC for Ethernet).
     pub chaddr: [u8; 16],
+
+    /// Server host name (or option overflow area if Option 52 is set).
     pub sname: [u8; 64],
+
+    /// Boot file name (or option overflow area if Option 52 is set).
     pub file: [u8; 128],
+
+    /// DHCP options parsed from the packet.
     pub options: Vec<DhcpOption>,
 }
 
 impl DhcpPacket {
+    /// Parses a DHCP packet from raw bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Raw packet bytes received from the network
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPacket`] if:
+    /// - Packet is shorter than 240 bytes (fixed header + magic cookie)
+    /// - Magic cookie is invalid (not 99.130.83.99)
+    /// - Hop count exceeds 16 (relay loop protection)
+    /// - Hardware length doesn't match type (e.g., Ethernet must be 6)
+    /// - Options are malformed (truncated length or data)
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < DHCP_FIXED_HEADER_SIZE {
             return Err(Error::InvalidPacket(format!(
@@ -198,6 +312,10 @@ impl DhcpPacket {
         Ok(options)
     }
 
+    /// Encodes the packet to bytes for transmission.
+    ///
+    /// The returned buffer is at least 300 bytes (padded per RFC 2131).
+    /// Options are encoded in TLV format with an End marker.
     pub fn encode(&self) -> Vec<u8> {
         let mut packet = Vec::with_capacity(DHCP_ENCODE_CAPACITY);
 
@@ -234,6 +352,9 @@ impl DhcpPacket {
         packet
     }
 
+    /// Returns the DHCP message type (Option 53) if present.
+    ///
+    /// Returns `None` for BOOTP packets which don't have this option.
     pub fn message_type(&self) -> Option<MessageType> {
         for option in &self.options {
             if let DhcpOption::MessageType(msg_type) = option {
@@ -243,6 +364,10 @@ impl DhcpPacket {
         None
     }
 
+    /// Returns the requested IP address (Option 50) if present.
+    ///
+    /// Clients include this in DISCOVER to request a specific IP,
+    /// and in REQUEST to confirm the offered IP.
     pub fn requested_ip(&self) -> Option<Ipv4Addr> {
         for option in &self.options {
             if let DhcpOption::RequestedIpAddress(ip) = option {
@@ -252,6 +377,10 @@ impl DhcpPacket {
         None
     }
 
+    /// Returns the server identifier (Option 54) if present.
+    ///
+    /// Clients include this in REQUEST to indicate which server's
+    /// offer they are accepting.
     pub fn server_identifier(&self) -> Option<Ipv4Addr> {
         for option in &self.options {
             if let DhcpOption::ServerIdentifier(ip) = option {
@@ -261,6 +390,10 @@ impl DhcpPacket {
         None
     }
 
+    /// Returns the client identifier (Option 61) if present.
+    ///
+    /// This option allows clients to identify themselves with a value
+    /// other than their hardware address.
     pub fn client_identifier(&self) -> Option<&[u8]> {
         for option in &self.options {
             if let DhcpOption::ClientIdentifier(id) = option {
@@ -270,6 +403,9 @@ impl DhcpPacket {
         None
     }
 
+    /// Returns the relay agent information (Option 82) if present.
+    ///
+    /// This is added by DHCP relay agents and must be echoed in replies.
     pub fn relay_agent_info(&self) -> Option<&[u8]> {
         for option in &self.options {
             if let DhcpOption::RelayAgentInfo(info) = option {
@@ -279,6 +415,7 @@ impl DhcpPacket {
         None
     }
 
+    /// Returns the client hostname (Option 12) if present.
     pub fn hostname(&self) -> Option<&str> {
         for option in &self.options {
             if let DhcpOption::Hostname(name) = option {
@@ -288,6 +425,9 @@ impl DhcpPacket {
         None
     }
 
+    /// Returns the parameter request list (Option 55) if present.
+    ///
+    /// This is a list of option codes the client wants in the response.
     pub fn parameter_request_list(&self) -> Option<&[u8]> {
         for option in &self.options {
             if let DhcpOption::ParameterRequestList(params) = option {
@@ -297,6 +437,10 @@ impl DhcpPacket {
         None
     }
 
+    /// Returns the requested lease time (Option 51) if present.
+    ///
+    /// Clients may request a specific lease duration. The server may
+    /// honor this request or provide a different duration.
     pub fn requested_lease_time(&self) -> Option<u32> {
         for option in &self.options {
             if let DhcpOption::LeaseTime(time) = option {
@@ -306,10 +450,14 @@ impl DhcpPacket {
         None
     }
 
+    /// Returns the client hardware address bytes (respecting hlen).
     pub fn chaddr_bytes(&self) -> &[u8] {
         &self.chaddr[..self.hlen as usize]
     }
 
+    /// Formats the client hardware address as a colon-separated string.
+    ///
+    /// For Ethernet, returns format like "aa:bb:cc:dd:ee:ff".
     pub fn format_mac(&self) -> String {
         let len = (self.hlen as usize).min(self.chaddr.len());
         self.chaddr[..len]
@@ -319,6 +467,10 @@ impl DhcpPacket {
             .join(":")
     }
 
+    /// Returns a unique client identifier for lease tracking.
+    ///
+    /// Uses Option 61 (Client Identifier) if present, otherwise
+    /// constructs an identifier from hardware type + hardware address.
     pub fn client_id(&self) -> Vec<u8> {
         if let Some(id) = self.client_identifier() {
             id.to_vec()
@@ -329,10 +481,34 @@ impl DhcpPacket {
         }
     }
 
+    /// Returns true if the broadcast flag (bit 15) is set.
+    ///
+    /// When set, servers must broadcast replies instead of unicasting.
     pub fn is_broadcast(&self) -> bool {
         (self.flags & 0x8000) != 0
     }
 
+    /// Creates a DHCP reply packet from a request.
+    ///
+    /// This handles OFFER, ACK, and NAK responses. The message type is
+    /// automatically added as the first option.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The client's request packet
+    /// * `message_type` - Type of reply (Offer, Ack, Nak)
+    /// * `your_ip` - IP address being assigned (yiaddr)
+    /// * `server_ip` - This server's IP (siaddr)
+    /// * `options` - Additional options to include
+    ///
+    /// # Preserved Fields
+    ///
+    /// The following fields are copied from the request:
+    /// - `xid` (transaction ID)
+    /// - `flags` (broadcast flag)
+    /// - `giaddr` (relay agent address)
+    /// - `chaddr` (client hardware address)
+    /// - `htype` and `hlen` (hardware type/length)
     pub fn create_reply(
         request: &DhcpPacket,
         message_type: MessageType,
@@ -362,6 +538,10 @@ impl DhcpPacket {
         }
     }
 
+    /// Creates a BOOTP reply packet (no message type option).
+    ///
+    /// Used for legacy BOOTP clients that don't send a message type.
+    /// The response includes options but not the Message Type option.
     pub fn create_bootp_reply(
         request: &DhcpPacket,
         your_ip: Ipv4Addr,

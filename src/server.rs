@@ -1,3 +1,25 @@
+//! DHCP server implementation.
+//!
+//! This module contains the main [`DhcpServer`] that listens for DHCP packets
+//! on UDP port 67 and handles the complete DHCP protocol flow.
+//!
+//! # Protocol Flow
+//!
+//! The server handles the following message types:
+//!
+//! - **DISCOVER** → Allocates IP and sends OFFER
+//! - **REQUEST** → Creates lease and sends ACK (or NAK on error)
+//! - **RELEASE** → Removes lease and returns IP to pool
+//! - **DECLINE** → Marks IP as unavailable for 1 hour
+//! - **INFORM** → Sends configuration without IP allocation
+//! - **BOOTP** → Legacy support with infinite lease
+//!
+//! # Relay Agent Support
+//!
+//! The server supports DHCP relay agents (RFC 3046):
+//! - Replies are sent to `giaddr` when set
+//! - Relay Agent Info (Option 82) is echoed in responses
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -14,13 +36,49 @@ use crate::lease::Leases;
 use crate::options::{DhcpOption, MessageType};
 use crate::packet::{BOOTREQUEST, DhcpPacket};
 
+/// Standard DHCP server port (per RFC 2131).
 const DHCP_SERVER_PORT: u16 = 67;
+
+/// Standard DHCP client port (per RFC 2131).
 const DHCP_CLIENT_PORT: u16 = 68;
+
+/// Rate limiting window in seconds.
 const RATE_LIMIT_WINDOW_SECS: u64 = 1;
+
+/// Maximum requests per client per window before rate limiting.
 const RATE_LIMIT_MAX_REQUESTS: usize = 10;
+
+/// Number of tracked clients before triggering cleanup of stale entries.
 const RATE_LIMIT_CLEANUP_THRESHOLD: usize = 1000;
+
+/// UDP receive buffer size (standard Ethernet MTU).
 const RECV_BUFFER_SIZE: usize = 1500;
 
+/// A DHCP server that listens on UDP port 67.
+///
+/// The server handles all DHCP message types and manages IP leases.
+/// It runs as an async task and processes packets concurrently.
+///
+/// # Example
+///
+/// ```no_run
+/// use dhcplease::{Config, DhcpServer};
+///
+/// #[tokio::main]
+/// async fn main() -> dhcplease::Result<()> {
+///     let config = Config::load_or_create("config.json").await?;
+///     let server = DhcpServer::new(config).await?;
+///
+///     // Run until interrupted
+///     tokio::select! {
+///         result = server.run() => result,
+///         _ = tokio::signal::ctrl_c() => {
+///             server.save_leases().await?;
+///             Ok(())
+///         }
+///     }
+/// }
+/// ```
 pub struct DhcpServer {
     config: Arc<Config>,
     leases: Arc<Leases>,
@@ -29,6 +87,21 @@ pub struct DhcpServer {
 }
 
 impl DhcpServer {
+    /// Creates a new DHCP server with the given configuration.
+    ///
+    /// This binds to UDP port 67 on all interfaces. On Windows, if
+    /// `interface_index` is configured, the socket is bound to that
+    /// specific interface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The socket cannot be created or bound (usually permissions)
+    /// - The lease file cannot be loaded
+    ///
+    /// # Permissions
+    ///
+    /// Binding to port 67 requires administrator/root privileges.
     pub async fn new(config: Config) -> Result<Self> {
         let config = Arc::new(config);
         let leases = Arc::new(Leases::new(Arc::clone(&config)).await?);
@@ -106,6 +179,14 @@ impl DhcpServer {
         Ok(tokio_socket)
     }
 
+    /// Runs the DHCP server, processing packets until an error occurs.
+    ///
+    /// This method runs forever, spawning a new async task for each
+    /// received packet. Errors in packet handling are logged but do
+    /// not stop the server.
+    ///
+    /// To stop the server gracefully, use `tokio::select!` with a
+    /// shutdown signal and call [`save_leases`](Self::save_leases) before exiting.
     pub async fn run(&self) -> Result<()> {
         let mut buffer = [0u8; RECV_BUFFER_SIZE];
 
@@ -139,14 +220,19 @@ impl DhcpServer {
         }
     }
 
+    /// Saves all leases to disk immediately.
+    ///
+    /// Call this before shutting down to ensure lease state is persisted.
     pub async fn save_leases(&self) -> Result<()> {
         self.leases.save().await
     }
 
+    /// Returns a reference to the server configuration.
     pub fn config(&self) -> &Config {
         &self.config
     }
 
+    /// Returns a reference to the lease manager.
     pub fn leases(&self) -> &Leases {
         &self.leases
     }
