@@ -35,7 +35,7 @@ dhcplease -c my-config.json run
 dhcplease -l debug run
 ```
 
-**Note:** DHCP requires binding to port 67, which requires administrator privileges on Windows.
+**Note:** Binding to port 67 requires administrator privileges. Run from an elevated PowerShell or Command Prompt.
 
 ### Other commands
 
@@ -115,11 +115,10 @@ To always assign a specific IP to a MAC address:
 ### Prerequisites
 
 1. **Windows host machine** running dhcplease
-2. **A second device** (laptop, phone, Raspberry Pi, etc.) that needs an IP address
-3. **Direct connection** between devices via:
-   - Ethernet cable (direct or through a switch)
+2. **A second device** (laptop, Raspberry Pi, etc.) that needs an IP address
+3. **Direct Ethernet connection** between devices via:
+   - Ethernet cable (direct or through an isolated switch)
    - USB-to-Ethernet adapter
-   - WiFi hotspot (Windows host acts as hotspot)
 
 ### Setup Steps
 
@@ -150,7 +149,7 @@ Set-NetIPInterface -InterfaceIndex <InterfaceIndex> -Dhcp Disabled
 
 #### 4. Configure dhcplease
 
-Create or edit `config.json`:
+Create or edit `config.json`, replacing `12` with your actual interface index:
 
 ```json
 {
@@ -162,7 +161,7 @@ Create or edit `config.json`:
   "dns_servers": ["8.8.8.8", "8.8.4.4"],
   "lease_duration_seconds": 3600,
   "leases_file": "leases.json",
-  "interface_index": <InterfaceIndex>
+  "interface_index": 12
 }
 ```
 
@@ -190,59 +189,205 @@ dhcplease -l debug run
 
 #### 7. Connect and test the client device
 
-On the client device:
-- Connect to the network (ethernet cable or WiFi hotspot)
-- Set the interface to obtain IP via DHCP
-- Renew the DHCP lease:
-  - **Windows client:** `ipconfig /release && ipconfig /renew`
-  - **Linux client:** `sudo dhclient -r && sudo dhclient`
-  - **macOS client:** System Preferences > Network > Renew DHCP Lease
+On the client device, connect via Ethernet and trigger a DHCP request.
+
+**Windows client:**
+```cmd
+ipconfig /release
+ipconfig /renew
+```
+
+**Linux client:**
+```bash
+sudo dhclient -r eth0 && sudo dhclient eth0
+```
+
+**macOS client (see detailed section below):**
+```bash
+sudo ipconfig set en6 DHCP
+```
 
 You should see DISCOVER, OFFER, REQUEST, and ACK messages in the dhcplease output.
 
-### Verifying the lease
+### Testing with a MacBook
 
-On the Windows host:
+This section covers testing dhcplease from a Windows host with a MacBook as the DHCP client.
+
+#### Hardware Setup
+
+Connect the MacBook to your Windows machine:
+- **Direct connection:** USB-C/Thunderbolt to Ethernet adapter on MacBook, Ethernet cable to Windows
+- **Through a switch:** Both machines connected to an isolated switch (no other DHCP server)
+
+#### Find the MacBook's Ethernet Interface
+
+On the MacBook, open Terminal and run:
+
+```bash
+networksetup -listallhardwareports
+```
+
+Look for your USB/Thunderbolt Ethernet adapter. It will show something like:
+
+```
+Hardware Port: USB 10/100/1000 LAN
+Device: en6
+Ethernet Address: aa:bb:cc:dd:ee:ff
+```
+
+Note the device name (e.g., `en6`).
+
+#### Request a DHCP Lease
+
+With the Windows host running dhcplease, run on the MacBook:
+
+```bash
+# Release any existing lease and request a new one
+sudo ipconfig set en6 DHCP
+
+# Or force a renewal
+sudo ipconfig set en6 BOOTP && sudo ipconfig set en6 DHCP
+```
+
+#### Verify the Lease
+
+Check the assigned IP on the MacBook:
+
+```bash
+ipconfig getifaddr en6
+```
+
+View full DHCP information:
+
+```bash
+ipconfig getpacket en6
+```
+
+This shows the server IP, lease time, DNS servers, and other options received.
+
+#### Monitor DHCP Traffic (Optional)
+
+To see the raw DHCP packets on macOS:
+
+```bash
+sudo tcpdump -i en6 -n port 67 or port 68
+```
+
+#### Expected Output
+
+On the Windows host running `dhcplease -l debug run`, you should see:
+
+```
+INFO DISCOVER from aa:bb:cc:dd:ee:ff (0.0.0.0:68)
+INFO OFFER 192.168.1.100 to aa:bb:cc:dd:ee:ff
+INFO REQUEST from aa:bb:cc:dd:ee:ff (0.0.0.0:68)
+INFO ACK 192.168.1.100 to aa:bb:cc:dd:ee:ff (lease: 3600 seconds)
+```
+
+#### Troubleshooting macOS
+
+| Issue | Solution |
+|-------|----------|
+| `en6` not found | Run `networksetup -listallhardwareports` to find correct interface |
+| No IP assigned | Check Windows firewall, verify cable connection |
+| Gets `169.254.x.x` | DHCP failed; check dhcplease is running and interface_index is correct |
+| Adapter not recognized | Try unplugging and replugging the USB-Ethernet adapter |
+
+### Testing with a Linux Client
+
+#### Find the Ethernet Interface
+
+```bash
+ip link show
+```
+
+Look for your Ethernet interface (commonly `eth0`, `enp0s3`, or `enpXsY` for USB adapters).
+
+#### Request a DHCP Lease
+
+**Using dhclient (Debian/Ubuntu):**
+
+```bash
+# Release existing lease
+sudo dhclient -r eth0
+
+# Request new lease
+sudo dhclient -v eth0
+```
+
+The `-v` flag shows verbose output including the DHCP exchange.
+
+**Using dhcpcd (Arch, Raspberry Pi OS):**
+
+```bash
+# Release and renew
+sudo dhcpcd -k eth0
+sudo dhcpcd eth0
+```
+
+**Using NetworkManager (most desktop distros):**
+
+```bash
+# Restart the connection
+nmcli connection down "Wired connection 1"
+nmcli connection up "Wired connection 1"
+
+# Or force DHCP renewal
+nmcli device reapply eth0
+```
+
+**Using systemd-networkd:**
+
+```bash
+sudo networkctl renew eth0
+```
+
+#### Verify the Lease
+
+```bash
+# Show IP address
+ip addr show eth0
+
+# Show full lease info (dhclient)
+cat /var/lib/dhcp/dhclient.leases
+
+# Show lease info (dhcpcd)
+cat /var/lib/dhcpcd/dhcpcd-eth0.lease
+```
+
+#### Monitor DHCP Traffic
+
+```bash
+sudo tcpdump -i eth0 -n port 67 or port 68
+```
+
+#### Troubleshooting Linux
+
+| Issue | Solution |
+|-------|----------|
+| Interface not found | Check `ip link show`, interface may have different name |
+| Permission denied | Run dhclient/dhcpcd with `sudo` |
+| Gets `169.254.x.x` | Link-local fallback means DHCP failed; check server is running |
+| NetworkManager conflicts | Stop NetworkManager: `sudo systemctl stop NetworkManager` |
+| No response | Verify firewall on Windows host allows UDP 67/68 |
+
+### Testing with a Raspberry Pi
+
+Raspberry Pi makes an excellent isolated test client:
+
+1. Connect Pi to Windows host via Ethernet (direct or through switch)
+2. Boot the Pi (it will automatically try DHCP)
+3. Or manually trigger: `sudo dhcpcd -n eth0`
+
+For headless setup, monitor dhcplease output to see when the Pi gets an IP, then SSH to that address.
+
+### Verifying Leases on the Server
 
 ```powershell
 dhcplease list-leases
 ```
 
-On the client:
-- **Windows:** `ipconfig /all`
-- **Linux/macOS:** `ip addr` or `ifconfig`
-
-### Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| "Access denied" error | Run dhcplease as Administrator |
-| No packets received | Check firewall rules, verify interface_index |
-| Client not getting IP | Ensure client is set to DHCP, check cable/connection |
-| Wrong interface | Use `Get-NetAdapter` to verify interface_index |
-
-### Testing with a USB-to-Ethernet Adapter
-
-USB-to-Ethernet adapters work well for isolated testing:
-
-1. Plug in the adapter
-2. Run `Get-NetAdapter` to find its interface index
-3. Set a static IP on the adapter
-4. Configure dhcplease with that interface_index
-5. Connect your test device to the adapter
-
-This keeps your test network completely isolated from your main network.
-
-## Using as a library
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-dhcplease = { path = "../dhcplease" }
-```
-
-Example:
+## Using as a Library
 
 ```rust
 use dhcplease::{Config, DhcpServer};
@@ -254,6 +399,8 @@ async fn main() -> dhcplease::Result<()> {
     server.run().await
 }
 ```
+
+See the [API documentation](https://docs.rs/dhcplease) for details on programmatic configuration.
 
 ## License
 
