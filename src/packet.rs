@@ -356,12 +356,10 @@ impl DhcpPacket {
     ///
     /// Returns `None` for BOOTP packets which don't have this option.
     pub fn message_type(&self) -> Option<MessageType> {
-        for option in &self.options {
-            if let DhcpOption::MessageType(msg_type) = option {
-                return Some(*msg_type);
-            }
-        }
-        None
+        self.options.iter().find_map(|opt| match opt {
+            DhcpOption::MessageType(t) => Some(*t),
+            _ => None,
+        })
     }
 
     /// Returns the requested IP address (Option 50) if present.
@@ -369,12 +367,10 @@ impl DhcpPacket {
     /// Clients include this in DISCOVER to request a specific IP,
     /// and in REQUEST to confirm the offered IP.
     pub fn requested_ip(&self) -> Option<Ipv4Addr> {
-        for option in &self.options {
-            if let DhcpOption::RequestedIpAddress(ip) = option {
-                return Some(*ip);
-            }
-        }
-        None
+        self.options.iter().find_map(|opt| match opt {
+            DhcpOption::RequestedIpAddress(ip) => Some(*ip),
+            _ => None,
+        })
     }
 
     /// Returns the server identifier (Option 54) if present.
@@ -382,12 +378,10 @@ impl DhcpPacket {
     /// Clients include this in REQUEST to indicate which server's
     /// offer they are accepting.
     pub fn server_identifier(&self) -> Option<Ipv4Addr> {
-        for option in &self.options {
-            if let DhcpOption::ServerIdentifier(ip) = option {
-                return Some(*ip);
-            }
-        }
-        None
+        self.options.iter().find_map(|opt| match opt {
+            DhcpOption::ServerIdentifier(ip) => Some(*ip),
+            _ => None,
+        })
     }
 
     /// Returns the client identifier (Option 61) if present.
@@ -395,46 +389,38 @@ impl DhcpPacket {
     /// This option allows clients to identify themselves with a value
     /// other than their hardware address.
     pub fn client_identifier(&self) -> Option<&[u8]> {
-        for option in &self.options {
-            if let DhcpOption::ClientIdentifier(id) = option {
-                return Some(id);
-            }
-        }
-        None
+        self.options.iter().find_map(|opt| match opt {
+            DhcpOption::ClientIdentifier(id) => Some(id.as_slice()),
+            _ => None,
+        })
     }
 
     /// Returns the relay agent information (Option 82) if present.
     ///
     /// This is added by DHCP relay agents and must be echoed in replies.
     pub fn relay_agent_info(&self) -> Option<&[u8]> {
-        for option in &self.options {
-            if let DhcpOption::RelayAgentInfo(info) = option {
-                return Some(info);
-            }
-        }
-        None
+        self.options.iter().find_map(|opt| match opt {
+            DhcpOption::RelayAgentInfo(info) => Some(info.as_slice()),
+            _ => None,
+        })
     }
 
     /// Returns the client hostname (Option 12) if present.
     pub fn hostname(&self) -> Option<&str> {
-        for option in &self.options {
-            if let DhcpOption::Hostname(name) = option {
-                return Some(name);
-            }
-        }
-        None
+        self.options.iter().find_map(|opt| match opt {
+            DhcpOption::Hostname(name) => Some(name.as_str()),
+            _ => None,
+        })
     }
 
     /// Returns the parameter request list (Option 55) if present.
     ///
     /// This is a list of option codes the client wants in the response.
     pub fn parameter_request_list(&self) -> Option<&[u8]> {
-        for option in &self.options {
-            if let DhcpOption::ParameterRequestList(params) = option {
-                return Some(params);
-            }
-        }
-        None
+        self.options.iter().find_map(|opt| match opt {
+            DhcpOption::ParameterRequestList(params) => Some(params.as_slice()),
+            _ => None,
+        })
     }
 
     /// Returns the requested lease time (Option 51) if present.
@@ -442,12 +428,10 @@ impl DhcpPacket {
     /// Clients may request a specific lease duration. The server may
     /// honor this request or provide a different duration.
     pub fn requested_lease_time(&self) -> Option<u32> {
-        for option in &self.options {
-            if let DhcpOption::LeaseTime(time) = option {
-                return Some(*time);
-            }
-        }
-        None
+        self.options.iter().find_map(|opt| match opt {
+            DhcpOption::LeaseTime(time) => Some(*time),
+            _ => None,
+        })
     }
 
     /// Returns the client hardware address bytes (respecting hlen).
@@ -459,12 +443,16 @@ impl DhcpPacket {
     ///
     /// For Ethernet, returns format like "aa:bb:cc:dd:ee:ff".
     pub fn format_mac(&self) -> String {
+        use std::fmt::Write;
         let len = (self.hlen as usize).min(self.chaddr.len());
-        self.chaddr[..len]
-            .iter()
-            .map(|byte| format!("{:02x}", byte))
-            .collect::<Vec<_>>()
-            .join(":")
+        let mut result = String::with_capacity(len * 3);
+        for (index, byte) in self.chaddr[..len].iter().enumerate() {
+            if index > 0 {
+                result.push(':');
+            }
+            let _ = write!(result, "{:02x}", byte);
+        }
+        result
     }
 
     /// Returns a unique client identifier for lease tracking.

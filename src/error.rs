@@ -54,7 +54,7 @@ pub enum Error {
     /// No lease exists for the specified client.
     ///
     /// Returned when attempting to renew or release a lease that doesn't exist.
-    #[error("MAC address {0} not found in leases")]
+    #[error("Client {0} not found in leases")]
     LeaseNotFound(String),
 }
 

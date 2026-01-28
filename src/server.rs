@@ -276,7 +276,7 @@ impl PacketHandler {
             return Err(Error::InvalidPacket("Expected BOOTREQUEST".to_string()));
         }
 
-        let mac_bytes: [u8; 6] = packet.chaddr[..6].try_into().unwrap_or([0; 6]);
+        let mac_bytes: [u8; 6] = packet.chaddr[..6].try_into().expect("chaddr is 16 bytes");
         let mac = packet.format_mac();
 
         if self.is_rate_limited(mac_bytes).await {
