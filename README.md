@@ -5,7 +5,7 @@
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-dhcplease-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">](https://docs.rs/dhcplease)
 [<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/matthewjberger/dhcplease/rust.yml?branch=main&style=for-the-badge" height="20">](https://github.com/matthewjberger/dhcplease/actions?query=branch%3Amain)
 
-A DHCP server for Windows, written in Rust.
+A cross-platform DHCP server library and CLI, written in Rust.
 
 ## Features
 
@@ -18,6 +18,7 @@ A DHCP server for Windows, written in Rust.
 - Concurrent packet handling with rate limiting
 - CLI and library crate for embedding in your own applications
 - Async/await with Tokio
+- Cross-platform (Linux, macOS, Windows); interface binding on Windows
 
 ## Quick Start
 
@@ -25,7 +26,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dhcplease = "0.1.0"
+dhcplease = "0.2.0"
 ```
 
 ## Installation

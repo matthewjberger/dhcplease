@@ -1,8 +1,8 @@
 [package]
 name = "dhcplease"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Matthew Berger <matthewjordanberger@gmail.com>"]
-description = "A developer-grade DHCP server for Windows"
+description = "A cross-platform DHCP server library and CLI"
 readme = "README.md"
 homepage = "https://github.com/matthewjberger/dhcplease"
 repository = "https://github.com/matthewjberger/dhcplease"
