@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tracing::{error, info, warn};
 
 use crate::config::{Config, sanitize_hostname};
@@ -59,6 +59,9 @@ const RECV_BUFFER_SIZE: usize = 1500;
 /// The server handles all DHCP message types and manages IP leases.
 /// It runs as an async task and processes packets concurrently.
 ///
+/// `DhcpServer` is cheaply clonable (all clones share the same underlying
+/// state). This allows passing a handle to a shutdown task.
+///
 /// # Example
 ///
 /// ```no_run
@@ -69,21 +72,24 @@ const RECV_BUFFER_SIZE: usize = 1500;
 ///     let config = Config::load_or_create("config.json").await?;
 ///     let server = DhcpServer::new(config).await?;
 ///
-///     // Run until interrupted
-///     tokio::select! {
-///         result = server.run() => result,
-///         _ = tokio::signal::ctrl_c() => {
-///             server.save_leases().await?;
-///             Ok(())
-///         }
-///     }
+///     // Shutdown on ctrl+c
+///     let shutdown_handle = server.clone();
+///     tokio::spawn(async move {
+///         tokio::signal::ctrl_c().await.ok();
+///         shutdown_handle.shutdown().await;
+///     });
+///
+///     server.run().await
 /// }
 /// ```
+#[derive(Clone)]
 pub struct DhcpServer {
     config: Arc<Config>,
     leases: Arc<Leases>,
     socket: Arc<UdpSocket>,
     rate_limiter: Arc<Mutex<HashMap<[u8; 6], Vec<Instant>>>>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl DhcpServer {
@@ -119,11 +125,15 @@ impl DhcpServer {
             config.pool_size()
         );
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
         Ok(Self {
             config,
             leases,
             socket,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            shutdown_tx: Arc::new(shutdown_tx),
+            shutdown_rx,
         })
     }
 
@@ -179,45 +189,88 @@ impl DhcpServer {
         Ok(tokio_socket)
     }
 
-    /// Runs the DHCP server, processing packets until an error occurs.
+    /// Runs the DHCP server, processing packets until shutdown is requested.
     ///
-    /// This method runs forever, spawning a new async task for each
-    /// received packet. Errors in packet handling are logged but do
-    /// not stop the server.
+    /// This method spawns a new async task for each received packet.
+    /// Errors in packet handling are logged but do not stop the server.
     ///
-    /// To stop the server gracefully, use `tokio::select!` with a
-    /// shutdown signal and call [`save_leases`](Self::save_leases) before exiting.
+    /// The server runs until [`shutdown`](Self::shutdown) is called, at which
+    /// point it saves leases and returns `Ok(())`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use dhcplease::{Config, DhcpServer};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> dhcplease::Result<()> {
+    ///     let config = Config::load_or_create("config.json").await?;
+    ///     let server = DhcpServer::new(config).await?;
+    ///
+    ///     // Shutdown after ctrl+c
+    ///     let server_handle = server.clone();
+    ///     tokio::spawn(async move {
+    ///         tokio::signal::ctrl_c().await.ok();
+    ///         server_handle.shutdown().await;
+    ///     });
+    ///
+    ///     server.run().await
+    /// }
+    /// ```
     pub async fn run(&self) -> Result<()> {
         let mut buffer = [0u8; RECV_BUFFER_SIZE];
+        let mut shutdown_rx = self.shutdown_rx.clone();
 
         info!("DHCP server ready and listening");
 
         loop {
-            match self.socket.recv_from(&mut buffer).await {
-                Ok((size, source)) => {
-                    let data = buffer[..size].to_vec();
-                    let config = Arc::clone(&self.config);
-                    let leases = Arc::clone(&self.leases);
-                    let socket = Arc::clone(&self.socket);
-                    let rate_limiter = Arc::clone(&self.rate_limiter);
+            tokio::select! {
+                result = self.socket.recv_from(&mut buffer) => {
+                    match result {
+                        Ok((size, source)) => {
+                            let data = buffer[..size].to_vec();
+                            let config = Arc::clone(&self.config);
+                            let leases = Arc::clone(&self.leases);
+                            let socket = Arc::clone(&self.socket);
+                            let rate_limiter = Arc::clone(&self.rate_limiter);
 
-                    tokio::spawn(async move {
-                        let handler = PacketHandler {
-                            config,
-                            leases,
-                            socket,
-                            rate_limiter,
-                        };
-                        if let Err(error) = handler.handle_packet(&data, source).await {
-                            warn!("Error handling packet from {}: {}", source, error);
+                            tokio::spawn(async move {
+                                let handler = PacketHandler {
+                                    config,
+                                    leases,
+                                    socket,
+                                    rate_limiter,
+                                };
+                                if let Err(error) = handler.handle_packet(&data, source).await {
+                                    warn!("Error handling packet from {}: {}", source, error);
+                                }
+                            });
                         }
-                    });
+                        Err(error) => {
+                            error!("Error receiving packet: {}", error);
+                        }
+                    }
                 }
-                Err(error) => {
-                    error!("Error receiving packet: {}", error);
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Shutdown signal received, stopping server...");
+                        self.save_leases().await?;
+                        return Ok(());
+                    }
                 }
             }
         }
+    }
+
+    /// Signals the server to shut down gracefully.
+    ///
+    /// This method returns immediately. The server will finish processing
+    /// the current packet (if any), save leases to disk, and then
+    /// [`run`](Self::run) will return `Ok(())`.
+    ///
+    /// Safe to call multiple times; subsequent calls have no effect.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 
     /// Saves all leases to disk immediately.

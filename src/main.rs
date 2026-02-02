@@ -46,16 +46,14 @@ async fn main() -> Result<()> {
             info!("Starting DHCP server with config: {:?}", cli.config);
             let server = DhcpServer::new(config).await?;
 
-            tokio::select! {
-                result = server.run() => result,
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received shutdown signal, stopping server...");
-                    if let Err(error) = server.save_leases().await {
-                        tracing::error!("Failed to save leases on shutdown: {}", error);
-                    }
-                    Ok(())
-                }
-            }
+            let shutdown_handle = server.clone();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                info!("Received shutdown signal");
+                shutdown_handle.shutdown().await;
+            });
+
+            server.run().await
         }
         Commands::ShowConfig => {
             println!("{}", serde_json::to_string_pretty(&config)?);
