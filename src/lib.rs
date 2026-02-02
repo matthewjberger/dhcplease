@@ -40,7 +40,9 @@ pub mod options;
 pub mod packet;
 pub mod server;
 
-pub use config::Config;
+pub use config::{
+    normalize_mac, sanitize_domain_name, sanitize_hostname, Config, StaticBinding,
+};
 pub use error::{Error, Result};
 pub use lease::{Lease, Leases};
 pub use options::{DhcpOption, MessageType};
