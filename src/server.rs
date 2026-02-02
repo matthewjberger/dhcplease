@@ -37,10 +37,10 @@ use crate::options::{DhcpOption, MessageType};
 use crate::packet::{BOOTREQUEST, DhcpPacket};
 
 /// Standard DHCP server port (per RFC 2131).
-const DHCP_SERVER_PORT: u16 = 67;
+pub const DHCP_SERVER_PORT: u16 = 67;
 
 /// Standard DHCP client port (per RFC 2131).
-const DHCP_CLIENT_PORT: u16 = 68;
+pub const DHCP_CLIENT_PORT: u16 = 68;
 
 /// Rate limiting window in seconds.
 const RATE_LIMIT_WINDOW_SECS: u64 = 1;

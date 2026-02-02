@@ -45,4 +45,4 @@ pub use error::{Error, Result};
 pub use lease::{Lease, Leases};
 pub use options::{DhcpOption, MessageType};
 pub use packet::DhcpPacket;
-pub use server::DhcpServer;
+pub use server::{DhcpServer, DHCP_CLIENT_PORT, DHCP_SERVER_PORT};
