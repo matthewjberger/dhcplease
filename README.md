@@ -1,5 +1,10 @@
 # dhcplease
 
+[<img alt="github" src="https://img.shields.io/badge/github-matthewjberger/dhcplease-8da0cb?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/matthewjberger/dhcplease)
+[<img alt="crates.io" src="https://img.shields.io/crates/v/dhcplease.svg?style=for-the-badge&color=fc8d62&logo=rust" height="20">](https://crates.io/crates/dhcplease)
+[<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-dhcplease-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">](https://docs.rs/dhcplease)
+[<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/matthewjberger/dhcplease/rust.yml?branch=main&style=for-the-badge" height="20">](https://github.com/matthewjberger/dhcplease/actions?query=branch%3Amain)
+
 A DHCP server for Windows, written in Rust.
 
 ## Features
@@ -14,7 +19,22 @@ A DHCP server for Windows, written in Rust.
 - CLI and library crate for embedding in your own applications
 - Async/await with Tokio
 
+## Quick Start
+
+Add this to your `Cargo.toml`:
+
+```toml
+[dependencies]
+dhcplease = "0.1.0"
+```
+
 ## Installation
+
+```bash
+cargo install dhcplease
+```
+
+Or build from source:
 
 ```bash
 cargo install --path .
