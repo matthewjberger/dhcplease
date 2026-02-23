@@ -211,6 +211,13 @@ impl DhcpPacket {
             )));
         }
 
+        if hlen as usize > DHCP_CHADDR_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "Hardware address length {} exceeds maximum {}",
+                hlen, DHCP_CHADDR_SIZE
+            )));
+        }
+
         if htype == HTYPE_ETHERNET && hlen != HLEN_ETHERNET {
             return Err(Error::InvalidPacket(format!(
                 "Invalid hlen {} for Ethernet (expected {})",

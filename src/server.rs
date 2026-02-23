@@ -425,7 +425,7 @@ impl PacketHandler {
             },
         };
 
-        let options = self.build_offer_options();
+        let options = self.build_offer_options(self.config.lease_duration_seconds);
         let mut options = self.filter_options_by_prl(options, packet.parameter_request_list());
         if let Some(relay_info) = packet.relay_agent_info() {
             options.push(DhcpOption::RelayAgentInfo(relay_info.to_vec()));
@@ -528,7 +528,7 @@ impl PacketHandler {
             }
         };
 
-        let options = self.build_offer_options();
+        let options = self.build_offer_options(lease_duration);
         let mut options = self.filter_options_by_prl(options, packet.parameter_request_list());
         if let Some(relay_info) = packet.relay_agent_info() {
             options.push(DhcpOption::RelayAgentInfo(relay_info.to_vec()));
@@ -687,10 +687,10 @@ impl PacketHandler {
         }
     }
 
-    fn build_offer_options(&self) -> Vec<DhcpOption> {
+    fn build_offer_options(&self, lease_duration: u32) -> Vec<DhcpOption> {
         let mut options = vec![
             DhcpOption::ServerIdentifier(self.config.server_ip),
-            DhcpOption::LeaseTime(self.config.lease_duration_seconds),
+            DhcpOption::LeaseTime(lease_duration),
         ];
 
         self.build_common_options(&mut options);
@@ -699,21 +699,17 @@ impl PacketHandler {
             self.config.calculate_broadcast(),
         ));
 
-        if let Some(renewal) = self.config.renewal_time_seconds {
-            options.push(DhcpOption::RenewalTime(renewal));
-        } else {
-            options.push(DhcpOption::RenewalTime(
-                self.config.lease_duration_seconds / 2,
-            ));
-        }
+        let renewal = match self.config.renewal_time_seconds {
+            Some(configured) if configured < lease_duration => configured,
+            _ => lease_duration / 2,
+        };
+        options.push(DhcpOption::RenewalTime(renewal));
 
-        if let Some(rebinding) = self.config.rebinding_time_seconds {
-            options.push(DhcpOption::RebindingTime(rebinding));
-        } else {
-            options.push(DhcpOption::RebindingTime(
-                (self.config.lease_duration_seconds * 7) / 8,
-            ));
-        }
+        let rebinding = match self.config.rebinding_time_seconds {
+            Some(configured) if configured < lease_duration => configured,
+            _ => (lease_duration * 7) / 8,
+        };
+        options.push(DhcpOption::RebindingTime(rebinding));
 
         if let Some(mtu) = self.config.mtu {
             options.push(DhcpOption::InterfaceMtu(mtu));
@@ -1205,7 +1201,7 @@ mod tests {
 
         assert_eq!(packet.relay_agent_info(), Some(relay_info.as_slice()));
 
-        let mut options = handler.build_offer_options();
+        let mut options = handler.build_offer_options(handler.config.lease_duration_seconds);
         if let Some(info) = packet.relay_agent_info() {
             options.push(DhcpOption::RelayAgentInfo(info.to_vec()));
         }
@@ -1275,7 +1271,7 @@ mod tests {
 
         let offered_ip = handler.leases.allocate_ip(&client_id).await.unwrap();
 
-        let offer_options = handler.build_offer_options();
+        let offer_options = handler.build_offer_options(handler.config.lease_duration_seconds);
         let offer = DhcpPacket::create_reply(
             &discover,
             MessageType::Offer,
@@ -1342,7 +1338,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ack_options = handler.build_offer_options();
+        let ack_options = handler.build_offer_options(handler.config.lease_duration_seconds);
         let ack = DhcpPacket::create_reply(
             &request,
             MessageType::Ack,
@@ -1482,7 +1478,7 @@ mod tests {
     async fn test_build_offer_options() {
         let (handler, _guard, _socket) = create_test_handler("offer_opts").await;
 
-        let options = handler.build_offer_options();
+        let options = handler.build_offer_options(handler.config.lease_duration_seconds);
 
         assert!(options.iter().any(|opt| matches!(
             opt,
@@ -1550,7 +1546,7 @@ mod tests {
     async fn test_filter_options_by_prl() {
         let (handler, _guard, _socket) = create_test_handler("prl_filter").await;
 
-        let options = handler.build_offer_options();
+        let options = handler.build_offer_options(handler.config.lease_duration_seconds);
 
         let prl_subnet_only: &[u8] = &[1];
         let filtered = handler.filter_options_by_prl(options.clone(), Some(prl_subnet_only));
@@ -1878,7 +1874,7 @@ mod tests {
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        let options = handler.build_offer_options();
+        let options = handler.build_offer_options(handler.config.lease_duration_seconds);
 
         let renewal_time = options.iter().find_map(|opt| {
             if let DhcpOption::RenewalTime(t) = opt {

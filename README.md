@@ -26,7 +26,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dhcplease = "0.2.0"
+dhcplease = "0.2.1"
 ```
 
 ## Installation
